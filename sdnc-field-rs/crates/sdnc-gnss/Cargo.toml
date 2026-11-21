@@ -1,0 +1,14 @@
+[package]
+name = "sdnc-gnss"
+version.workspace = true
+edition.workspace = true
+license.workspace = true
+
+[dependencies]
+sdnc-geo = { path = "../sdnc-geo" }
+anyhow.workspace = true
+serde.workspace = true
+serde_json.workspace = true
+log.workspace = true
+nalgebra.workspace = true
+chrono.workspace = true
