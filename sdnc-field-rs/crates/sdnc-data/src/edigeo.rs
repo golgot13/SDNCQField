@@ -48,18 +48,36 @@ pub enum EdigeoObjectType {
 
 impl EdigeoObjectType {
     pub fn from_code(code: &str) -> Self {
-        match code {
-            "PARCELLE" | "Parcelle" => EdigeoObjectType::Parcelle,
-            "SECTION" | "Section" => EdigeoObjectType::Section,
-            "SUBDFISCAL" | "SUBDFISC" => EdigeoObjectType::SubdivisionFiscale,
-            "LIEUDIT" => EdigeoObjectType::LieuDit,
-            "BATIMENT" | "BATIMENT_DUR" => EdigeoObjectType::Batiment,
-            "TRONROUTE" | "ROUTE" => EdigeoObjectType::Route,
-            "TRONEAU" | "HYDRO" => EdigeoObjectType::Hydro,
-            "COMMUNE" | "COMMUNE_id" => EdigeoObjectType::Commune,
-            "PTCANV" | "BORNE" => EdigeoObjectType::PointGeo,
-            "NUMVOIE" | "ZONCOMMUNI" | "LABEL" => EdigeoObjectType::Texte,
-            _ => EdigeoObjectType::Autre(code.to_string()),
+        let u = code.trim().to_uppercase();
+        if u.contains("PARCELLE") {
+            EdigeoObjectType::Parcelle
+        } else if u.contains("BATIMENT") {
+            EdigeoObjectType::Batiment
+        } else if u.contains("SECTION") || u.contains("SUBDSECT") {
+            EdigeoObjectType::Section
+        } else if u.contains("SUBDFISC") {
+            EdigeoObjectType::SubdivisionFiscale
+        } else if u.contains("LIEUDIT") {
+            EdigeoObjectType::LieuDit
+        } else if u.contains("TRONROUTE") || u.contains("VOIEP") || u == "ROUTE" {
+            EdigeoObjectType::Route
+        } else if u.contains("TRONEAU") || u.contains("TRONFLUV") || u.contains("HYDRO") {
+            EdigeoObjectType::Hydro
+        } else if u.contains("COMMUNE") {
+            EdigeoObjectType::Commune
+        } else if u.contains("PTCANV") || u.contains("BORNE") || u.contains("TPOINT") {
+            EdigeoObjectType::PointGeo
+        } else if u.contains("NUMVOIE")
+            || u.contains("ZONCOMMUNI")
+            || u.contains("LABEL")
+            || u.contains("TEX")
+            || u.contains("TLINE")
+            || u.contains("TSURF")
+            || u.contains("SYMBLIM")
+        {
+            EdigeoObjectType::Texte
+        } else {
+            EdigeoObjectType::Autre(code.to_string())
         }
     }
 
@@ -205,23 +223,38 @@ impl EdigeoParser {
         let parent_dir = thf_path.parent().unwrap_or(Path::new("."));
         let mut document = EdigeoDocument::new();
 
-        // Parser le fichier THF pour obtenir la liste des fichiers
-        let file_list = Self::parse_thf(&thf_path)?;
+        // Parser le fichier THF + découvrir automatiquement tous les fichiers .GEO/.DIC/.SCD/.VEC du lot
+        let mut file_list = Self::parse_thf(&thf_path)?;
+        Self::discover_sibling_files(parent_dir, &mut file_list);
+
+        // Garantir l'ordre de parsing : GEO / DIC / SCD d'abord, puis VEC
+        file_list.sort_by_key(|f| {
+            let ext = Path::new(f)
+                .extension()
+                .map(|e| e.to_string_lossy().to_uppercase())
+                .unwrap_or_default();
+            match ext.as_str() {
+                "GEO" => 0,
+                "DIC" => 1,
+                "SCD" => 2,
+                "VEC" => 3,
+                _ => 4,
+            }
+        });
 
         // Dictionnaire pour les attributs
         let mut dictionnaire: HashMap<String, String> = HashMap::new();
 
-        // Géométries indexées par ID
+        // Géométries indexées par ID (utilisées par le format simplifié)
         let mut geometries: HashMap<String, Vec<Coordinate>> = HashMap::new();
         let mut geometry_types: HashMap<String, String> = HashMap::new();
 
         // Parser chaque fichier référencé
         for filename in &file_list {
-            let file_path = parent_dir.join(filename);
-            if !file_path.exists() {
-                log::warn!("EDIGEO file not found: {:?}", file_path);
+            let Some(file_path) = Self::resolve_case_insensitive(parent_dir, filename) else {
+                log::warn!("EDIGEO file not found: {:?}", parent_dir.join(filename));
                 continue;
-            }
+            };
 
             let ext = file_path
                 .extension()
@@ -230,7 +263,12 @@ impl EdigeoParser {
 
             match ext.as_str() {
                 "GEO" => {
-                    Self::parse_geo(&file_path, &mut geometries, &mut geometry_types)?;
+                    Self::parse_geo(
+                        &file_path,
+                        &mut document,
+                        &mut geometries,
+                        &mut geometry_types,
+                    )?;
                 }
                 "DIC" => {
                     Self::parse_dic(&file_path, &mut dictionnaire)?;
@@ -257,12 +295,52 @@ impl EdigeoParser {
         }
 
         log::info!(
-            "EDIGEO parsed: {} objects, {} types",
+            "EDIGEO parsed: {} objects, {} types, crs={}",
             document.all_objects.len(),
-            document.objects.len()
+            document.objects.len(),
+            document.projection
         );
 
         Ok(document)
+    }
+
+    fn resolve_case_insensitive(dir: &Path, filename: &str) -> Option<PathBuf> {
+        let direct = dir.join(filename);
+        if direct.exists() {
+            return Some(direct);
+        }
+        let target_lower = filename.to_lowercase();
+        if let Ok(entries) = fs::read_dir(dir) {
+            for entry in entries.flatten() {
+                let p = entry.path();
+                if let Some(name) = p.file_name().and_then(|n| n.to_str()) {
+                    if name.to_lowercase() == target_lower {
+                        return Some(p);
+                    }
+                }
+            }
+        }
+        None
+    }
+
+    fn discover_sibling_files(dir: &Path, files: &mut Vec<String>) {
+        let mut seen: std::collections::HashSet<String> =
+            files.iter().map(|s| s.to_lowercase()).collect();
+        if let Ok(entries) = fs::read_dir(dir) {
+            for entry in entries.flatten() {
+                let p = entry.path();
+                if let Some(ext) = p.extension().and_then(|e| e.to_str()) {
+                    let ext_u = ext.to_uppercase();
+                    if matches!(ext_u.as_str(), "GEO" | "DIC" | "SCD" | "VEC") {
+                        if let Some(name) = p.file_name().and_then(|n| n.to_str()) {
+                            if seen.insert(name.to_lowercase()) {
+                                files.push(name.to_string());
+                            }
+                        }
+                    }
+                }
+            }
+        }
     }
 
     fn find_thf_file(dir: &Path) -> Result<PathBuf> {
@@ -285,29 +363,24 @@ impl EdigeoParser {
 
         for line in reader.lines() {
             let line = line?;
-            // Format: LOT:xxx ou LOTL:xxx
-            if line.starts_with("LOT") || line.starts_with("EOF") {
+            let trimmed = line.trim();
+            if trimmed.starts_with("LOT") || trimmed.starts_with("EOF") {
                 continue;
             }
-            // Chercher les références de fichiers
-            if let Some(filename) = Self::extract_filename(&line) {
-                files.push(filename);
-            }
-        }
-
-        // Si aucun fichier trouvé, chercher les fichiers par convention de nommage
-        if files.is_empty() {
-            let stem = path.file_stem().and_then(|s| s.to_str()).unwrap_or("");
-            let parent = path.parent().unwrap_or(Path::new("."));
-
-            for ext in &["GEO", "DIC", "SCD", "QAL", "VEC"] {
-                let candidate = parent.join(format!("{}.{}", stem, ext));
-                if candidate.exists() {
-                    let name = candidate
-                        .file_name()
-                        .map(|n| n.to_string_lossy().to_string())
-                        .unwrap_or_else(|| candidate.to_string_lossy().to_string());
-                    files.push(name);
+            // Format DGFiP officiel : GEOSA..:<stem>, LONSA..:<stem>, GNSSA..:<stem>, GDCSA..:<stem>
+            if let Some(val) = trimmed.split_once(':').map(|(_, v)| v.trim()) {
+                if !val.is_empty() && !val.contains(' ') {
+                    if val.contains('.') {
+                        files.push(val.to_string());
+                    } else if trimmed.starts_with("GEOSA") {
+                        files.push(format!("{}.GEO", val));
+                    } else if trimmed.starts_with("LONSA") || trimmed.starts_with("GDLSA") {
+                        files.push(format!("{}.VEC", val));
+                    } else if trimmed.starts_with("GDCSA") {
+                        files.push(format!("{}.DIC", val));
+                    } else if trimmed.starts_with("GNSSA") {
+                        files.push(format!("{}.SCD", val));
+                    }
                 }
             }
         }
@@ -315,20 +388,9 @@ impl EdigeoParser {
         Ok(files)
     }
 
-    fn extract_filename(line: &str) -> Option<String> {
-        // Chercher les patterns de fichiers EDIGEO
-        let parts: Vec<&str> = line.split(':').collect();
-        if parts.len() >= 2 {
-            let value = parts[1].trim();
-            if value.contains('.') && !value.contains(' ') {
-                return Some(value.to_string());
-            }
-        }
-        None
-    }
-
     fn parse_geo(
         path: &Path,
+        document: &mut EdigeoDocument,
         geometries: &mut HashMap<String, Vec<Coordinate>>,
         geometry_types: &mut HashMap<String, String>,
     ) -> Result<()> {
@@ -343,54 +405,39 @@ impl EdigeoParser {
             let line = line?;
             let trimmed = line.trim();
 
-            // Nouvel objet géométrique
-            if trimmed.starts_with("RIDSA") {
-                // Sauvegarder l'objet précédent
+            // Projection officielle DGFiP dans .GEO : RELSA..:LAMB93, RGF93CC44, LAMB2E, etc.
+            if trimmed.starts_with("RELSA") {
+                if let Some((_, val)) = trimmed.split_once(':') {
+                    let s = val.trim();
+                    if !s.is_empty() {
+                        document.projection = s.to_string();
+                    }
+                }
+            }
+            // Nouvel objet géométrique (format simplifié)
+            else if trimmed.starts_with("RIDSA") {
                 if !current_id.is_empty() && !current_coords.is_empty() {
                     geometries.insert(current_id.clone(), current_coords.clone());
                     geometry_types.insert(current_id.clone(), current_type.clone());
                 }
-
-                // Extraire l'ID
-                if let Some(id) = Self::extract_value(trimmed, "RIDSA") {
+                if let Some(id) = Self::nf_value(trimmed).or_else(|| Self::extract_value(trimmed, "RIDSA")) {
                     current_id = id;
                     current_coords.clear();
                 }
-            }
-            // Type de primitive (PAR, ARC, PNO)
-            else if trimmed.starts_with("TYPSA") {
-                if let Some(t) = Self::extract_value(trimmed, "TYPSA") {
+            } else if trimmed.starts_with("TYPSA") {
+                if let Some(t) = Self::nf_value(trimmed).or_else(|| Self::extract_value(trimmed, "TYPSA")) {
                     current_type = t;
                 }
-            }
-            // Coordonnées
-            else if trimmed.starts_with("CORCC") {
-                // Format: CORCC;x;y ou CORCC:x:y
-                let parts: Vec<&str> = trimmed.split([';', ':']).collect();
-                if parts.len() >= 3 {
-                    if let (Ok(x), Ok(y)) = (
-                        parts[1].trim().parse::<f64>(),
-                        parts[2].trim().parse::<f64>(),
-                    ) {
-                        current_coords.push(Coordinate::new(x, y));
-                    }
-                }
-            }
-            // Coordonnées alternatives
-            else if trimmed.starts_with("PTCCP") || trimmed.starts_with("SATYP") {
-                let parts: Vec<&str> = trimmed.split([';', ':']).collect();
-                if parts.len() >= 3 {
-                    if let (Ok(x), Ok(y)) = (
-                        parts[1].trim().parse::<f64>(),
-                        parts[2].trim().parse::<f64>(),
-                    ) {
-                        current_coords.push(Coordinate::new(x, y));
-                    }
+            } else if trimmed.starts_with("CORCC")
+                || trimmed.starts_with("PTCCP")
+                || trimmed.starts_with("SATYP")
+            {
+                if let Some(coord) = Self::parse_corcc(trimmed) {
+                    current_coords.push(coord);
                 }
             }
         }
 
-        // Sauvegarder le dernier objet
         if !current_id.is_empty() && !current_coords.is_empty() {
             geometries.insert(current_id.clone(), current_coords);
             geometry_types.insert(current_id, current_type);
@@ -409,18 +456,55 @@ impl EdigeoParser {
             let line = line?;
             let trimmed = line.trim();
 
-            if trimmed.starts_with("RIDDI") {
-                if let Some(key) = Self::extract_value(trimmed, "RIDDI") {
+            if trimmed.starts_with("RIDDI") || trimmed.starts_with("RIDSA") {
+                if let Some(key) = Self::nf_value(trimmed).or_else(|| Self::extract_value(trimmed, "RIDDI")) {
                     current_key = key;
                 }
-            } else if trimmed.starts_with("DINM") {
-                if let Some(name) = Self::extract_value(trimmed, "DINM") {
-                    dictionnaire.insert(current_key.clone(), name);
+            } else if trimmed.starts_with("DINM") || trimmed.starts_with("LABSA") {
+                if let Some(name) = Self::nf_value(trimmed).or_else(|| Self::extract_value(trimmed, "DINM")) {
+                    if !current_key.is_empty() {
+                        dictionnaire.insert(current_key.clone(), name);
+                    }
                 }
             }
         }
 
         Ok(())
+    }
+
+    /// Extrait la valeur après `:` pour une ligne NF Z 52-000 (`TAGnn:valeur`).
+    fn nf_value(line: &str) -> Option<String> {
+        line.split_once(':').map(|(_, v)| v.trim().to_string())
+    }
+
+    /// Extrait le dernier identifiant d'une référence composée NF Z 52-000 (`a;b;c;ID`).
+    fn nf_ref_id(line: &str) -> Option<String> {
+        let val = Self::nf_value(line)?;
+        val.split(';')
+            .rev()
+            .find(|s| !s.trim().is_empty())
+            .map(|s| s.trim().to_string())
+    }
+
+    /// Parse une ligne de coordonnées `CORCC..:+894500.12;+6269500.34;` ou `CORCC;x;y`.
+    fn parse_corcc(trimmed: &str) -> Option<Coordinate> {
+        let payload = trimmed.split_once(':').map(|(_, v)| v).unwrap_or(trimmed);
+        let nums: Vec<f64> = payload
+            .split([';', ':'])
+            .filter_map(|p| {
+                let s = p.trim();
+                if s.is_empty() {
+                    None
+                } else {
+                    s.parse::<f64>().ok()
+                }
+            })
+            .collect();
+        if nums.len() >= 2 {
+            Some(Coordinate::new(nums[0], nums[1]))
+        } else {
+            None
+        }
     }
 
     fn parse_vec(
@@ -429,19 +513,19 @@ impl EdigeoParser {
         geometries: &HashMap<String, Vec<Coordinate>>,
         geometry_types: &HashMap<String, String>,
     ) -> Result<()> {
-        let file = File::open(path)?;
-        let reader = BufReader::new(file);
+        let content = fs::read_to_string(path)?;
+        // Détection automatique : format officiel NF Z 52-000 (`RTYSA..:`) vs format simplifié (`RIDOB`)
+        if content.contains("RTYSA") {
+            return Self::parse_vec_nfz52000(&content, document);
+        }
 
         let mut current_obj: Option<EdigeoObject> = None;
         let mut current_geo_refs: Vec<String> = Vec::new();
 
-        for line in reader.lines() {
-            let line = line?;
+        for line in content.lines() {
             let trimmed = line.trim();
 
-            // Nouvel objet
             if trimmed.starts_with("RIDOB") {
-                // Sauvegarder l'objet précédent
                 if let Some(mut obj) = current_obj.take() {
                     obj.geometry =
                         Self::build_geometry(&current_geo_refs, geometries, geometry_types);
@@ -457,24 +541,18 @@ impl EdigeoParser {
                     });
                     current_geo_refs.clear();
                 }
-            }
-            // Type d'objet
-            else if trimmed.starts_with("TYOB") || trimmed.starts_with("SEESSION") {
+            } else if trimmed.starts_with("TYOB") || trimmed.starts_with("SEESSION") {
                 if let Some(ref mut obj) = current_obj {
-                    if let Some(type_code) = Self::extract_value(
-                        trimmed,
-                        if trimmed.starts_with("TYOB") {
-                            "TYOB"
-                        } else {
-                            "SEESSION"
-                        },
-                    ) {
+                    let prefix = if trimmed.starts_with("TYOB") {
+                        "TYOB"
+                    } else {
+                        "SEESSION"
+                    };
+                    if let Some(type_code) = Self::extract_value(trimmed, prefix) {
                         obj.object_type = EdigeoObjectType::from_code(&type_code);
                     }
                 }
-            }
-            // Référence géométrique
-            else if trimmed.starts_with("RIDO") || trimmed.starts_with("RIDG") {
+            } else if trimmed.starts_with("RIDO") || trimmed.starts_with("RIDG") {
                 let prefix = if trimmed.starts_with("RIDO") {
                     "RIDO"
                 } else {
@@ -483,20 +561,15 @@ impl EdigeoParser {
                 if let Some(geo_ref) = Self::extract_value(trimmed, prefix) {
                     current_geo_refs.push(geo_ref);
                 }
-            }
-            // Attribut
-            else if trimmed.starts_with("APTS") || trimmed.starts_with("ATPV") {
+            } else if trimmed.starts_with("APTS") || trimmed.starts_with("ATPV") {
                 if let Some(ref mut obj) = current_obj {
                     let parts: Vec<&str> = trimmed.splitn(3, [';', ':']).collect();
                     if parts.len() >= 3 {
-                        let attr_name = parts[1].trim().to_string();
-                        let attr_value = parts[2].trim().to_string();
-                        obj.attributes.insert(attr_name, attr_value);
+                        obj.attributes
+                            .insert(parts[1].trim().to_string(), parts[2].trim().to_string());
                     }
                 }
-            }
-            // Identifiant parcelle
-            else if trimmed.contains("IDU") || trimmed.contains("TEX") {
+            } else if trimmed.contains("IDU") || trimmed.contains("TEX") {
                 if let Some(ref mut obj) = current_obj {
                     let parts: Vec<&str> = trimmed.split([';', ':']).collect();
                     if parts.len() >= 2 {
@@ -507,13 +580,320 @@ impl EdigeoParser {
             }
         }
 
-        // Sauvegarder le dernier objet
         if let Some(mut obj) = current_obj {
             obj.geometry = Self::build_geometry(&current_geo_refs, geometries, geometry_types);
             document.all_objects.push(obj);
         }
 
         Ok(())
+    }
+
+    /// Parseur complet du format officiel DGFiP NF Z 52-000 `.VEC` :
+    /// reconstruit la topologie `PNO` (nœuds), `ARC` (arcs `CORCC`), `PAR` (faces polygonales
+    /// par chaînage d'arcs), `FEA` (objets cadastraux `PARCELLE`, `BATIMENT`, `SECTION`, etc.)
+    /// et `LNK` (liens `FTPCP`).
+    fn parse_vec_nfz52000(content: &str, document: &mut EdigeoDocument) -> Result<()> {
+        let mut nodes: HashMap<String, Coordinate> = HashMap::new();
+        let mut arcs: HashMap<String, Vec<Coordinate>> = HashMap::new();
+        let mut face_arcs: HashMap<String, Vec<String>> = HashMap::new();
+        let mut features: HashMap<String, EdigeoObject> = HashMap::new();
+        let mut feature_order: Vec<String> = Vec::new();
+        let mut fea_links: HashMap<String, Vec<String>> = HashMap::new();
+
+        #[derive(Clone, Copy, PartialEq)]
+        enum RecKind {
+            None,
+            Pno,
+            Arc,
+            Par,
+            Fea,
+            Lnk,
+        }
+
+        let mut kind = RecKind::None;
+        let mut cur_id = String::new();
+        let mut cur_coords: Vec<Coordinate> = Vec::new();
+        let mut cur_type = String::new();
+        let mut cur_attrs: HashMap<String, String> = HashMap::new();
+        let mut cur_attr_key = String::new();
+        let mut cur_links: Vec<String> = Vec::new();
+
+        let flush = |kind: RecKind,
+                     cur_id: &str,
+                     cur_coords: &[Coordinate],
+                     cur_type: &str,
+                     cur_attrs: &HashMap<String, String>,
+                     cur_links: &[String],
+                     nodes: &mut HashMap<String, Coordinate>,
+                     arcs: &mut HashMap<String, Vec<Coordinate>>,
+                     face_arcs: &mut HashMap<String, Vec<String>>,
+                     features: &mut HashMap<String, EdigeoObject>,
+                     feature_order: &mut Vec<String>,
+                     fea_links: &mut HashMap<String, Vec<String>>| {
+            match kind {
+                RecKind::Pno => {
+                    if !cur_id.is_empty() {
+                        if let Some(&c) = cur_coords.first() {
+                            nodes.insert(cur_id.to_string(), c);
+                        }
+                    }
+                }
+                RecKind::Arc => {
+                    if !cur_id.is_empty() && !cur_coords.is_empty() {
+                        arcs.insert(cur_id.to_string(), cur_coords.to_vec());
+                    }
+                }
+                RecKind::Par => {
+                    if !cur_id.is_empty() {
+                        face_arcs.entry(cur_id.to_string()).or_default();
+                    }
+                }
+                RecKind::Fea => {
+                    if !cur_id.is_empty() {
+                        let obj = EdigeoObject {
+                            id: cur_id.to_string(),
+                            object_type: EdigeoObjectType::from_code(cur_type),
+                            geometry: None,
+                            attributes: cur_attrs.clone(),
+                        };
+                        if !features.contains_key(cur_id) {
+                            feature_order.push(cur_id.to_string());
+                        }
+                        features.insert(cur_id.to_string(), obj);
+                    }
+                }
+                RecKind::Lnk => {
+                    if cur_links.len() >= 2 {
+                        // Identifier les liens PAR <-> ARC ou FEA <-> (PAR/ARC/PNO)
+                        let mut pars = Vec::new();
+                        let mut arc_ids = Vec::new();
+                        let mut fea_ids = Vec::new();
+                        let mut pno_ids = Vec::new();
+
+                        for r in cur_links {
+                            if features.contains_key(r) {
+                                fea_ids.push(r.clone());
+                            } else if face_arcs.contains_key(r) || r.starts_with("Face_") || r.starts_with("PAR_") {
+                                pars.push(r.clone());
+                            } else if arcs.contains_key(r) || r.starts_with("Arc_") || r.starts_with("ARC_") {
+                                arc_ids.push(r.clone());
+                            } else if nodes.contains_key(r) || r.starts_with("Noeud_") || r.starts_with("PNO_") {
+                                pno_ids.push(r.clone());
+                            }
+                        }
+
+                        if !pars.is_empty() && !arc_ids.is_empty() {
+                            for p in &pars {
+                                face_arcs.entry(p.clone()).or_default().extend(arc_ids.iter().cloned());
+                            }
+                        }
+                        if !fea_ids.is_empty() {
+                            for f in &fea_ids {
+                                let entry = fea_links.entry(f.clone()).or_default();
+                                entry.extend(pars.iter().cloned());
+                                entry.extend(arc_ids.iter().cloned());
+                                entry.extend(pno_ids.iter().cloned());
+                            }
+                        }
+                    }
+                }
+                RecKind::None => {}
+            }
+        };
+
+        for line in content.lines() {
+            let trimmed = line.trim();
+            if trimmed.starts_with("RTYSA") {
+                flush(
+                    kind,
+                    &cur_id,
+                    &cur_coords,
+                    &cur_type,
+                    &cur_attrs,
+                    &cur_links,
+                    &mut nodes,
+                    &mut arcs,
+                    &mut face_arcs,
+                    &mut features,
+                    &mut feature_order,
+                    &mut fea_links,
+                );
+                cur_id.clear();
+                cur_coords.clear();
+                cur_type.clear();
+                cur_attrs.clear();
+                cur_attr_key.clear();
+                cur_links.clear();
+
+                kind = match Self::nf_value(trimmed).as_deref() {
+                    Some("PNO") => RecKind::Pno,
+                    Some("ARC") => RecKind::Arc,
+                    Some("PAR") => RecKind::Par,
+                    Some("FEA") => RecKind::Fea,
+                    Some("LNK") => RecKind::Lnk,
+                    _ => RecKind::None,
+                };
+            } else if trimmed.starts_with("RIDSA") {
+                if let Some(id) = Self::nf_value(trimmed) {
+                    cur_id = id;
+                }
+            } else if trimmed.starts_with("CORCC") {
+                if let Some(c) = Self::parse_corcc(trimmed) {
+                    cur_coords.push(c);
+                }
+            } else if trimmed.starts_with("SCPCP") {
+                if let Some(t) = Self::nf_ref_id(trimmed) {
+                    cur_type = t;
+                }
+            } else if trimmed.starts_with("ATPCP") {
+                if let Some(k) = Self::nf_ref_id(trimmed) {
+                    // Normaliser les noms DGFiP courants (TEX_id -> TEX, IDU_id -> IDU, DUR_id -> DUR)
+                    cur_attr_key = k.trim_end_matches("_id").to_string();
+                }
+            } else if trimmed.starts_with("ATVCV") || trimmed.starts_with("ATVST") {
+                if let Some(v) = Self::nf_value(trimmed) {
+                    let key = if cur_attr_key.is_empty() {
+                        "TEX".to_string()
+                    } else {
+                        cur_attr_key.clone()
+                    };
+                    cur_attrs.insert(key, v);
+                }
+            } else if trimmed.starts_with("FTPCP") {
+                if let Some(r) = Self::nf_ref_id(trimmed) {
+                    cur_links.push(r);
+                }
+            }
+        }
+
+        flush(
+            kind,
+            &cur_id,
+            &cur_coords,
+            &cur_type,
+            &cur_attrs,
+            &cur_links,
+            &mut nodes,
+            &mut arcs,
+            &mut face_arcs,
+            &mut features,
+            &mut feature_order,
+            &mut fea_links,
+        );
+
+        // Assembler la géométrie de chaque FEA à partir de ses liens topologiques
+        for fid in feature_order {
+            if let Some(mut obj) = features.remove(&fid) {
+                if let Some(links) = fea_links.get(&fid) {
+                    let mut polygons: Vec<Vec<Vec<Coordinate>>> = Vec::new();
+                    let mut lines: Vec<Vec<Coordinate>> = Vec::new();
+                    let mut pts: Vec<Coordinate> = Vec::new();
+
+                    for r in links {
+                        if let Some(arc_list) = face_arcs.get(r) {
+                            let ring = Self::stitch_arcs_into_ring(arc_list, &arcs);
+                            if ring.len() >= 4 {
+                                polygons.push(vec![ring]);
+                            }
+                        } else if let Some(ac) = arcs.get(r) {
+                            if ac.len() >= 2 {
+                                lines.push(ac.clone());
+                            }
+                        } else if let Some(&pt) = nodes.get(r) {
+                            pts.push(pt);
+                        }
+                    }
+
+                    obj.geometry = if polygons.len() == 1 {
+                        Some(Geometry::Polygon {
+                            coordinates: polygons.remove(0),
+                        })
+                    } else if polygons.len() > 1 {
+                        Some(Geometry::MultiPolygon {
+                            coordinates: polygons,
+                        })
+                    } else if lines.len() == 1 {
+                        Some(Geometry::LineString {
+                            coordinates: lines.remove(0),
+                        })
+                    } else if lines.len() > 1 {
+                        Some(Geometry::MultiLineString { coordinates: lines })
+                    } else if pts.len() == 1 {
+                        Some(Geometry::Point {
+                            coordinates: pts[0],
+                        })
+                    } else if pts.len() > 1 {
+                        Some(Geometry::MultiPoint { coordinates: pts })
+                    } else {
+                        None
+                    };
+                }
+                if obj.geometry.is_some() {
+                    document.all_objects.push(obj);
+                }
+            }
+        }
+
+        Ok(())
+    }
+
+    /// Chaîne les arcs topologiques d'une face `PAR` en un anneau polygonal fermé ordonné.
+    fn stitch_arcs_into_ring(
+        arc_ids: &[String],
+        arcs: &HashMap<String, Vec<Coordinate>>,
+    ) -> Vec<Coordinate> {
+        let mut segments: Vec<Vec<Coordinate>> = arc_ids
+            .iter()
+            .filter_map(|id| arcs.get(id))
+            .filter(|pts| pts.len() >= 2)
+            .cloned()
+            .collect();
+        if segments.is_empty() {
+            return Vec::new();
+        }
+        let mut ring = segments.remove(0);
+        let dist2 = |a: Coordinate, b: Coordinate| (a.x - b.x).powi(2) + (a.y - b.y).powi(2);
+
+        while !segments.is_empty() {
+            let tail = *ring.last().unwrap();
+            let mut best_idx = 0usize;
+            let mut best_rev = false;
+            let mut best_d = f64::MAX;
+
+            for (i, seg) in segments.iter().enumerate() {
+                let d_start = dist2(tail, seg[0]);
+                if d_start < best_d {
+                    best_d = d_start;
+                    best_idx = i;
+                    best_rev = false;
+                }
+                let d_end = dist2(tail, *seg.last().unwrap());
+                if d_end < best_d {
+                    best_d = d_end;
+                    best_idx = i;
+                    best_rev = true;
+                }
+            }
+
+            let mut next_seg = segments.remove(best_idx);
+            if best_rev {
+                next_seg.reverse();
+            }
+            if best_d < 1e-4 {
+                ring.extend(next_seg.into_iter().skip(1));
+            } else {
+                ring.extend(next_seg);
+            }
+        }
+
+        if ring.len() >= 3 {
+            let first = ring[0];
+            let last = *ring.last().unwrap();
+            if dist2(first, last) > 1e-6 {
+                ring.push(first);
+            }
+        }
+        ring
     }
 
     fn parse_scd(path: &Path, document: &mut EdigeoDocument) -> Result<()> {
@@ -525,21 +905,18 @@ impl EdigeoParser {
             let trimmed = line.trim();
 
             if trimmed.starts_with("SCRC") {
-                // Système de coordonnées
                 if let Some(srs) = Self::extract_value(trimmed, "SCRC") {
-                    if srs.contains("93") || srs.contains("2154") {
-                        document.projection = "EPSG:2154".to_string();
+                    if !srs.is_empty() {
+                        document.projection = srs;
                     }
                 }
             } else if trimmed.starts_with("DTEFIN") || trimmed.starts_with("DATE") {
-                if let Some(date) = Self::extract_value(
-                    trimmed,
-                    if trimmed.starts_with("DTEFIN") {
-                        "DTEFIN"
-                    } else {
-                        "DATE"
-                    },
-                ) {
+                let prefix = if trimmed.starts_with("DTEFIN") {
+                    "DTEFIN"
+                } else {
+                    "DATE"
+                };
+                if let Some(date) = Self::extract_value(trimmed, prefix) {
                     document.date_maj = date;
                 }
             }

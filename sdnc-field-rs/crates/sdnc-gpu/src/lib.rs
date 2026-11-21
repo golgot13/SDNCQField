@@ -1,18 +1,16 @@
-//! `sdnc-gpu` — Moteur Vulkan Compute & Rendu GPU natif (`wgpu` + `egui_wgpu` + WGSL) pour SDNCQField.
+//! `sdnc-gpu` — Moteur GPU 2D Vulkan / WGPU (`egui_wgpu` + WGSL) pour SDNCQField.
 //!
-//! Fournit :
-//! - Sélection automatique Vulkan (Android, Linux) et Vulkan/DX12 (Windows)
-//! - Interpolation MNT IDW + calcul Pente & Ombrage (Hillshade) en compute shader WGSL
-//! - Shader de projection 3D & frustum culling parallèle (`point_project.wgsl`)
-//! - Rendu GPU natif `egui_wgpu::CallbackTrait` pour nuages LiDAR de plusieurs millions de points (`lidar_renderer`)
+//! Dédié à l'affichage cartographique 2D ultra-fluide sur Android, Windows et Linux :
+//! - Sélection Vulkan prioritaire (`VulkanComputeContext`)
+//! - Rendu natif `egui_wgpu::CallbackTrait` (`Vector2dWgpuCallback`) des plans cadastraux denses
+//!   (DXF, DXF-PCI, EDIGÉO, IGN WFS, GeoPackage) en 2 draw calls GPU par frame
+//! - Triangulation ear-clipping 2D des polygones concaves (parcelles & bâtiments)
 
 pub mod context;
-pub mod lidar_renderer;
-pub mod terrain;
+pub mod vector2d_renderer;
 
 pub use context::{GpuBackendInfo, VulkanComputeContext};
-pub use lidar_renderer::{
-    generate_synthetic_lidar_cloud, load_las_point_cloud, load_xyz_point_cloud, LidarCameraUniform,
-    LidarCloudData, LidarGpuPipeline, LidarPointGpu, LidarWgpuCallback,
+pub use vector2d_renderer::{
+    pack_rgba8, triangulate_polygon_earclip, Camera2dUniform, FillVertex2d, Segment2dGpu,
+    Vector2dGpuBatch, Vector2dGpuPipeline, Vector2dWgpuCallback,
 };
-pub use terrain::{TerrainCellOutput, TerrainGridResult, TerrainSampleGpu, VulkanTerrainEngine};

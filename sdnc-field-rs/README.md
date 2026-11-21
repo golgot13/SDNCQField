@@ -1,35 +1,45 @@
-# SDNCQField-RS (Rust + Vulkan Compute + Carto 2D/3D AEROPHOTOGRAM + RTKLIB-Rust)
+# SDNCQField-RS (Rust + Vulkan 2D Cadastre + Flux IGN Raster/Vecteurs + RTKLIB-Rust)
 
-Reconstruction modulaire 100 % Rust de **SDNCQField** remplaçant QGIS, GDAL, PROJ et Qt par :
+Reconstruction modulaire 100 % Rust de **SDNCQField** (PC Windows, PC Linux et Android tablettes & téléphones) remplaçant QGIS, GDAL, PROJ et Qt par une application **strictement 2D haute performance** :
 
-- **Cartographie 2D & 3D** extraites et découplées d'`AEROPHOTOGRAM` (`sdnc-geo` + `sdnc-ui`)
-- **Accélération GPU Vulkan Compute (`wgpu` / WGSL)** (`sdnc-gpu`) : interpolation MNT IDW, pente et ombrage (hillshade) en origine flottante `f32` (compatible GPU mobiles Android Mali/Adreno, Linux et Windows)
-- **Format de projet natif léger (`.sdnc.json` + `.gpkg`)** (`sdnc-data`) : provider OGC GeoPackage lecture/écriture complet (`rusqlite` bundled), GeoJSON, DXF, EDIGÉO et cache disque SQLite hors-ligne pour les tuiles IGN / OSM
+- **Moteur Cartographique 2D GPU natif Vulkan (`wgpu` / `egui_wgpu::CallbackTrait`)** (`sdnc-gpu` + `sdnc-ui`) :
+  - Triangulation **ear-clipping 2D** des polygones concaves (bâtiments en L/U, parcelles complexes)
+  - Buffers VRAM persistants en origine flottante `f32` (upload uniquement sur modification de couche)
+  - **2 draw calls GPU par frame** (remplissage polygones + segments cadastraux instanciés anti-aliasés avec culling frustum dans le vertex shader)
+  - Reprojection géodésique des tuiles raster par maillage 4×4 (adaptée d'`AEROPHOTOGRAM`)
+- **Support natif du Plan Cadastral Français** (`sdnc-data::cadastre`, `dxf.rs`, `edigeo.rs`) :
+  - **DXF & DXF-PCI** (entités `POLYLINE`+`VERTEX`+`SEQEND`, `LWPOLYLINE`, `LINE`, `CIRCLE`, `ARC`, `TEXT`/`MTEXT`, détection automatique `$PCI_PROJECTION` et couleurs ACI)
+  - **EDIGÉO DGFiP (NF Z 52-000)** (`.THF` / dossier complet, reconstruction topologique `PAR`/`ARC`/`PNO`/`FEA`/`LNK` par chaînage d'arcs, détection CRS `.GEO` `RELSA:LAMB93` / `RGF93CC42..50`)
+  - Symbologie cadastrale DGFiP automatique par calques (Sections, Parcelles, Bâtiments durs & légers, Voirie, Hydrographie, Bornes, Habillage/Textes)
+- **Flux IGN Géoplateforme Raster & Vecteurs** (`sdnc-geo`) :
+  - **Raster WMTS** avec cache disque SQLite hors-ligne : BD ORTHO, Plan IGN v2, Cadastre PCI Image, Parcellaire Express, Estompage, Altimétrie MNT, OpenStreetMap
+  - **Vecteurs WFS 2.0.0 GeoJSON** (`data.geopf.fr/wfs/ows`, `SRSNAME=CRS:84`) : Parcelles PCI Express, Bâtiments PCI Express, Feuilles/Sections PCI, BD TOPO v3 (Bâtiments, Routes, Cours d'eau, Communes) — sauvegardables hors-ligne dans le `.gpkg`
+- **Format de projet natif léger (`.sdnc.json` + `.gpkg`)** (`sdnc-data`) : provider OGC GeoPackage lecture/écriture complet (`rusqlite` bundled) + GeoJSON
 - **Moteur GNSS RTK & PPK adapté de RTKLIB en Rust pur** (`sdnc-gnss`) :
   - Éphémérides Kepler, Sagnac, Saastamoinen, Klobuchar (`ephemeris.rs`)
   - Résolution d'ambiguïtés entières **LAMBDA / MLAMBDA** + Ratio Test (`lambda.rs`)
-  - Filtre de Kalman Double-Différences **RTK Float / Fix** + SPP (`rtk_engine.rs`)
-  - Post-traitement **PPK Forward / Backward / Combined** sur RINEX 3 OBS & NAV (`ppk_solver.rs`, `rinex.rs`)
-  - Flux temps réel **NTRIP v1/v2**, **RTCM 3.x (CRC-24Q)**, **UBX (NAV-PVT / RXM-RAWX)**, **NMEA-0183** et pont **Android JNI**
+  - Filtre de Kalman Double-Différences **RTK Float / Fix** + SPP (`rtk_engine.rs`) + moyennage multi-époques
+  - Post-traitement **PPK Forward / Backward / Combined** sur RINEX 3 OBS & NAV (`ppk_solver.rs`, `rinex.rs`) + export CSV
+  - Flux temps réel **NTRIP v1/v2**, **RTCM 3.3 (CRC-24Q, 1005/1006, 1019/1046, MSM4/MSM7 bit-à-bit)**, **UBX (NAV-PVT / RXM-RAWX)**, **NMEA-0183**, **Bluetooth SPP / USB-Série Android** et pont JNI
 
 ## Architecture du workspace
 
 ```text
 sdnc-field-rs/
 ├── crates/
-│   ├── sdnc-geo/          # 28 CRS FR + WGS84, géoïde, Octree 3D, flux WMTS IGN/OSM + cache SQLite offline
-│   ├── sdnc-data/         # GeoPackage OGC R/W (GPB/WKB 2D/3D), projet .sdnc.json, GeoJSON, DXF, EDIGÉO, DEM
-│   ├── sdnc-gpu/          # Contexte Vulkan Compute (wgpu) + shaders WGSL (terrain_idw.wgsl, point_project.wgsl)
-│   ├── sdnc-gnss/         # RTKLIB en Rust pur (SPP, RTK EKF, LAMBDA, PPK Fwd/Bwd, RINEX 3, RTCM3, UBX, NTRIP, NMEA)
-│   ├── sdnc-ui/           # Interface tactile & desktop (egui + wgpu) : 2D, 3D Vulkan, Saisie/Snapping, Panneau RTK/PPK
-│   ├── sdnc-app-desktop/  # Exécutable Windows & Linux (`sdnc-field`)
-│   └── sdnc-app-android/  # Bibliothèque native Android (`libsdnc_field_android.so` + pont JNI GNSS)
-└── android/               # Gabarit AndroidManifest.xml + MainActivity.kt (GameActivity + Vulkan 1.1 + LocationManager)
+│   ├── sdnc-geo/          # 28 CRS FR + WGS84, géoïde, BAN, flux IGN WMTS (cache SQLite) & IGN WFS 2.0 GeoJSON
+│   ├── sdnc-data/         # GeoPackage OGC R/W (GPB/WKB 2D/3D), projet .sdnc.json, DXF/DXF-PCI, EDIGÉO NF Z 52-000, cadastre
+│   ├── sdnc-gpu/          # Contexte Vulkan (wgpu) + shader vector_2d.wgsl + Vector2dWgpuCallback (ear-clipping & segments instanciés)
+│   ├── sdnc-gnss/         # RTKLIB en Rust pur (SPP, RTK EKF, LAMBDA, PPK Fwd/Bwd, RINEX 3, RTCM3 MSM7, UBX, NTRIP, NMEA)
+│   ├── sdnc-ui/           # Interface 2D tactile & desktop (egui + wgpu) : Cadastre, IGN Raster/Vecteurs, Saisie/Snapping, RTK/PPK
+│   ├── sdnc-app-desktop/  # Exécutable PC Windows (.exe) & PC Linux (`sdnc-field`)
+│   └── sdnc-app-android/  # Bibliothèque native Android (`arm64-v8a` + `armeabi-v7a`, pont JNI GNSS & Bluetooth SPP)
+└── android/               # Projet Gradle Kotlin DSL (AndroidManifest.xml + MainActivity.kt + APK universel)
 ```
 
 ## Compilation & Tests
 
-### Linux / Windows (Desktop)
+### PC Linux & Windows
 
 ```bash
 cd sdnc-field-rs
@@ -37,19 +47,11 @@ cargo test --workspace
 cargo run --release -p sdnc-app-desktop
 ```
 
-Pour compiler un exécutable Windows depuis Linux (cross-compilation MinGW ou nativement sous Windows MSVC) :
+### Android Tablettes & Téléphones (`arm64-v8a` + `armeabi-v7a`, Vulkan 1.1+)
 
 ```bash
-# Sous Windows natif (MSVC + Vulkan/DX12) :
-cargo build --release -p sdnc-app-desktop
-```
-
-### Android (`arm64-v8a`, Vulkan 1.1+)
-
-Prérequis : Android NDK + `cargo-ndk` + cible Rust `aarch64-linux-android`.
-
-```bash
-rustup target add aarch64-linux-android
+rustup target add aarch64-linux-android armv7-linux-androideabi
 cargo install cargo-ndk
-cargo ndk -t arm64-v8a -o android/app/src/main/jniLibs build --release -p sdnc-app-android
+cargo ndk -t arm64-v8a -t armeabi-v7a -o android/app/src/main/jniLibs build --release -p sdnc-app-android
+cd android && ./gradlew assembleDebug
 ```

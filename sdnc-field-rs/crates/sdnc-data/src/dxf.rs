@@ -260,7 +260,18 @@ impl DxfParser {
                         "EOF" => break,
                         entity_type => {
                             if current_section == "ENTITIES" {
-                                if let Ok(et) = entity_type.parse::<DxfEntityType>() {
+                                if entity_type == "POLYLINE" {
+                                    if let Some(entity) = Self::parse_polyline_with_vertices(&mut lines) {
+                                        let layer_name = entity.layer.clone();
+                                        let idx = document.entities.len();
+                                        document.entities.push(entity);
+                                        document
+                                            .entities_by_layer
+                                            .entry(layer_name)
+                                            .or_default()
+                                            .push(idx);
+                                    }
+                                } else if let Ok(et) = entity_type.parse::<DxfEntityType>() {
                                     if let Some(entity) = Self::parse_entity(et, &mut lines) {
                                         let layer_name = entity.layer.clone();
                                         let idx = document.entities.len();
@@ -399,11 +410,23 @@ impl DxfParser {
                         .insert("text".to_string(), value.to_string());
                 }
 
-                // Rayon (CIRCLE)
+                // Rayon (CIRCLE / ARC) ou hauteur texte
                 40 => {
                     entity
                         .properties
                         .insert("radius".to_string(), value.to_string());
+                }
+                // Angle début (ARC) ou rotation (TEXT)
+                50 => {
+                    entity
+                        .properties
+                        .insert("start_angle".to_string(), value.to_string());
+                }
+                // Angle fin (ARC)
+                51 => {
+                    entity
+                        .properties
+                        .insert("end_angle".to_string(), value.to_string());
                 }
 
                 _ => {}
@@ -436,6 +459,108 @@ impl DxfParser {
             entity.coordinates = vec![Coordinate::new_3d(px, py, z.unwrap_or(0.0))];
         }
 
+        Some(entity)
+    }
+
+    /// Parse une entité classique `POLYLINE` suivie de ses sous-entités `VERTEX` jusqu'à `SEQEND`
+    /// (format natif des feuilles cadastrales DGFiP DXF-PCI).
+    fn parse_polyline_with_vertices<I>(lines: &mut std::iter::Peekable<I>) -> Option<DxfEntity>
+    where
+        I: Iterator<Item = std::io::Result<String>>,
+    {
+        let mut entity = DxfEntity {
+            entity_type: DxfEntityType::Polyline,
+            ..Default::default()
+        };
+
+        // 1. Lire l'en-tête POLYLINE jusqu'au prochain code 0
+        while let Some(Ok(peeked_line)) = lines.peek() {
+            let code: i32 = match peeked_line.trim().parse::<i32>() {
+                Ok(c) => c,
+                Err(_) => break,
+            };
+            if code == 0 {
+                break;
+            }
+            lines.next();
+            let value = lines.next().and_then(|r| r.ok()).unwrap_or_default();
+            let value = value.trim();
+            match code {
+                5 => entity.handle = value.to_string(),
+                8 => entity.layer = value.to_string(),
+                62 => entity.color = value.parse().unwrap_or(DXF_BYLAYER_COLOR),
+                70 => {
+                    let flags: i32 = value.parse().unwrap_or(0);
+                    entity.closed = (flags & 1) != 0;
+                }
+                _ => {}
+            }
+        }
+
+        // 2. Consommer toutes les sous-entités VERTEX jusqu'à SEQEND (ou fin de section)
+        let mut vertices: Vec<Coordinate> = Vec::new();
+        while let Some(Ok(peeked_line)) = lines.peek() {
+            let code: i32 = match peeked_line.trim().parse::<i32>() {
+                Ok(c) => c,
+                Err(_) => break,
+            };
+            if code != 0 {
+                break;
+            }
+            // Consommer le couple (0, sub_type)
+            lines.next();
+            let sub_type = lines
+                .next()
+                .and_then(|r| r.ok())
+                .unwrap_or_default()
+                .trim()
+                .to_string();
+
+            if sub_type == "SEQEND" {
+                // Consommer les attributs de SEQEND jusqu'au prochain code 0
+                while let Some(Ok(p)) = lines.peek() {
+                    if p.trim() == "0" {
+                        break;
+                    }
+                    lines.next();
+                    lines.next();
+                }
+                break;
+            } else if sub_type == "VERTEX" {
+                let mut vx: Option<f64> = None;
+                let mut vy: Option<f64> = None;
+                let mut vz: f64 = 0.0;
+                while let Some(Ok(p)) = lines.peek() {
+                    let vc: i32 = match p.trim().parse::<i32>() {
+                        Ok(c) => c,
+                        Err(_) => break,
+                    };
+                    if vc == 0 {
+                        break;
+                    }
+                    lines.next();
+                    let val = lines.next().and_then(|r| r.ok()).unwrap_or_default();
+                    let val = val.trim();
+                    match vc {
+                        10 => vx = val.parse().ok(),
+                        20 => vy = val.parse().ok(),
+                        30 => vz = val.parse().unwrap_or(0.0),
+                        _ => {}
+                    }
+                }
+                if let (Some(x), Some(y)) = (vx, vy) {
+                    vertices.push(Coordinate::new_3d(x, y, vz));
+                }
+            } else {
+                // Sous-entité inattendue : terminer la polyline proprement
+                break;
+            }
+        }
+
+        if vertices.len() < 2 {
+            return None;
+        }
+        entity.coordinates = vertices;
         Some(entity)
     }
 
@@ -520,18 +645,25 @@ impl DxfParser {
                     }
                 }
             }
-            // Variables PCI pour géoréférencement
-            "$PCIPROJ" | "$PROJECTION" => {
+            // Variables PCI pour géoréférencement (DXF-PCI DGFiP / PCI Geomatics)
+            "$PCIPROJ" | "$PCI_PROJECTION" | "$PROJECTION" => {
                 if let Some(Ok(_)) = lines.next() {
                     if let Some(Ok(value)) = lines.next() {
                         header.pci_projection = Some(value.trim().to_string());
                     }
                 }
             }
-            "$PCIDATUM" | "$DATUM" => {
+            "$PCIDATUM" | "$PCI_DATUM" | "$DATUM" => {
                 if let Some(Ok(_)) = lines.next() {
                     if let Some(Ok(value)) = lines.next() {
                         header.pci_datum = Some(value.trim().to_string());
+                    }
+                }
+            }
+            "$PCI_UNITS" => {
+                if let Some(Ok(_)) = lines.next() {
+                    if let Some(Ok(value)) = lines.next() {
+                        header.pci_units = Some(value.trim().to_string());
                     }
                 }
             }
@@ -884,6 +1016,41 @@ fn entity_to_feature(entity: &DxfEntity, idx: usize) -> Option<Feature> {
                 None
             }
         }
+        DxfEntityType::Arc => {
+            if let Some(center) = entity.coordinates.first() {
+                let radius = entity
+                    .properties
+                    .get("radius")
+                    .and_then(|s| s.parse::<f64>().ok())
+                    .filter(|&r| r > 0.0)?;
+                let start_deg = entity
+                    .properties
+                    .get("start_angle")
+                    .and_then(|s| s.parse::<f64>().ok())
+                    .unwrap_or(0.0);
+                let mut end_deg = entity
+                    .properties
+                    .get("end_angle")
+                    .and_then(|s| s.parse::<f64>().ok())
+                    .unwrap_or(180.0);
+                if end_deg <= start_deg {
+                    end_deg += 360.0;
+                }
+                let span_deg = (end_deg - start_deg).clamp(1.0, 360.0);
+                let segs = ((span_deg / 11.25).ceil() as usize).clamp(4, DXF_CIRCLE_SEGMENTS);
+                let mut coords = Vec::with_capacity(segs + 1);
+                for i in 0..=segs {
+                    let ang = (start_deg + span_deg * (i as f64 / segs as f64)).to_radians();
+                    coords.push(Coordinate::new(
+                        center.x + radius * ang.cos(),
+                        center.y + radius * ang.sin(),
+                    ));
+                }
+                Some(Geometry::LineString { coordinates: coords })
+            } else {
+                None
+            }
+        }
         DxfEntityType::Text | DxfEntityType::MText => {
             // Texte = Point avec propriété text
             entity.coordinates.first().map(|coord| Geometry::Point {
@@ -914,7 +1081,12 @@ fn entity_to_feature(entity: &DxfEntity, idx: usize) -> Option<Feature> {
         );
 
         for (k, v) in &entity.properties {
-            props.insert(k.clone(), PropertyValue::String(v.clone()));
+            let val = if k == "text" && entity.entity_type == DxfEntityType::MText {
+                clean_mtext(v)
+            } else {
+                v.clone()
+            };
+            props.insert(k.clone(), PropertyValue::String(val));
         }
 
         Feature {
@@ -923,6 +1095,17 @@ fn entity_to_feature(entity: &DxfEntity, idx: usize) -> Option<Feature> {
             properties: props,
         }
     })
+}
+
+/// Nettoie les balises MTEXT AutoCAD simples (`\P`, `{\f...;texte}`).
+fn clean_mtext(raw: &str) -> String {
+    let mut s = raw.replace("\\P", " ").replace("\\~", " ");
+    if let (Some(semi), Some(_)) = (s.find(';'), s.find("\\f").or_else(|| s.find("\\F"))) {
+        if let Some(rest) = s.get((semi + 1)..) {
+            s = rest.to_string();
+        }
+    }
+    s.replace(['{', '}'], "").trim().to_string()
 }
 
 #[cfg(test)]

@@ -19,7 +19,7 @@ fn main() -> eframe::Result<()> {
     let options = eframe::NativeOptions {
         renderer: eframe::Renderer::Wgpu,
         viewport: egui::ViewportBuilder::default()
-            .with_title("SDNCQField-RS — SIG Terrain 2D/3D Vulkan & GNSS RTK/PPK")
+            .with_title("SDNCQField-RS — Carto 2D Vulkan, Cadastre DXF/EDIGÉO, IGN & GNSS RTK/PPK")
             .with_inner_size([1360.0, 840.0])
             .with_min_inner_size([800.0, 560.0]),
         ..Default::default()

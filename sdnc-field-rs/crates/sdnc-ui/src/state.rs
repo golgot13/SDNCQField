@@ -1,23 +1,30 @@
-//! État global de l'application terrain SDNCQField (Rust + Vulkan Compute).
+//! État global de l'application terrain SDNCQField (Rust + Vulkan 2D + RTKLIB-Rust).
+//!
+//! Gère :
+//! - Le projet natif léger (`.sdnc.json` + `.gpkg`) et les couches vectorielles éditables
+//! - L'import cadastral multi-couches **DXF, DXF-PCI et EDIGÉO** avec détection CRS & symbologie DGFiP
+//! - Les flux **IGN Géoplateforme Raster (WMTS)** et **Vecteur (WFS 2.0 GeoJSON)** sauvegardables hors-ligne
+//! - Le batch VRAM GPU 2D (`sdnc_gpu::Vector2dGpuBatch`) pour le rendu Vulkan natif à 60–120 FPS
+//! - Le pilotage GNSS RTK & PPK + moyennage multi-époques
 
 use crate::viewport_2d::Viewport2dState;
-use crate::viewport_3d::Viewport3dState;
 use sdnc_data::{
+    generate_demo_cadastral_layers, load_dxf_cadastral_layers, load_edigeo_cadastral_layers,
     Coordinate, Feature, FeatureCollection, GeoPackage, Geometry, GeometryType, LayerSource,
-    ProjectLayerSpec, PropertyValue, SdncProject,
+    LayerStyle, ProjectLayerSpec, PropertyValue, SdncProject,
 };
-use sdnc_geo::{from_wgs84, reproject_point_3d, FrenchCrs, TileStreamClient};
+use sdnc_geo::{
+    fetch_ign_wfs_geojson, from_wgs84, reproject_point_3d, FrenchCrs, IgnWfsLayer, TileStreamClient,
+};
 use sdnc_gnss::{FixQuality, GnssController, GnssLiveTelemetry, PpkJobConfig};
-use sdnc_gpu::VulkanTerrainEngine;
+use sdnc_gpu::{
+    pack_rgba8, triangulate_polygon_earclip, FillVertex2d, Segment2dGpu, Vector2dGpuBatch,
+    VulkanComputeContext,
+};
 use std::collections::HashMap;
 use std::path::{Path, PathBuf};
-
-#[derive(Debug, Clone, Copy, PartialEq, Eq)]
-pub enum ViewMode {
-    Map2D,
-    Surface3D,
-    Split2D3D,
-}
+use std::sync::atomic::{AtomicBool, Ordering};
+use std::sync::{Arc, Mutex};
 
 #[derive(Debug, Clone, Copy, PartialEq, Eq)]
 pub enum MapTool {
@@ -95,6 +102,8 @@ impl GnssAveragingSession {
     }
 }
 
+type WfsInboxItem = (IgnWfsLayer, Result<FeatureCollection, String>);
+
 pub struct SdncFieldApp {
     pub project: SdncProject,
     pub project_dir: PathBuf,
@@ -103,7 +112,6 @@ pub struct SdncFieldApp {
     pub active_layer_idx: usize,
     pub undo_stack: Vec<(usize, FeatureCollection)>,
 
-    pub view_mode: ViewMode,
     pub active_tool: MapTool,
     pub show_layers_panel: bool,
     pub show_gnss_panel: bool,
@@ -112,14 +120,19 @@ pub struct SdncFieldApp {
     pub snapping_radius_px: f32,
 
     pub tile_client: TileStreamClient,
-    pub terrain_engine: VulkanTerrainEngine,
-    pub lidar_cloud: sdnc_gpu::LidarCloudData,
-    pub lidar_point_size_px: f32,
+    pub gpu_backend_label: String,
     pub wgpu_target_format: Option<egui_wgpu::wgpu::TextureFormat>,
+    pub vector_gpu_batch: Vector2dGpuBatch,
+    pub vector_gpu_dirty: bool,
     pub vp2d: Viewport2dState,
-    pub vp3d: Viewport3dState,
 
-    pub gnss: std::sync::Arc<GnssController>,
+    /// Emprise WGS84 de la vue 2D courante `(min_lon, min_lat, max_lon, max_lat)` pour les requêtes WFS IGN.
+    pub last_view_wgs84_bbox: Option<(f64, f64, f64, f64)>,
+    pub wfs_selected_layers: Vec<IgnWfsLayer>,
+    pub wfs_loading: Arc<AtomicBool>,
+    pub wfs_inbox: Arc<Mutex<Vec<WfsInboxItem>>>,
+
+    pub gnss: Arc<GnssController>,
     pub averaging: Option<GnssAveragingSession>,
     pub avg_target_epochs: usize,
     pub avg_require_fix: bool,
@@ -148,14 +161,14 @@ impl SdncFieldApp {
         Self::new_with_wgpu_and_gnss(
             base_dir,
             wgpu_target_format,
-            std::sync::Arc::new(GnssController::default()),
+            Arc::new(GnssController::default()),
         )
     }
 
     pub fn new_with_wgpu_and_gnss(
         base_dir: PathBuf,
         wgpu_target_format: Option<egui_wgpu::wgpu::TextureFormat>,
-        gnss: std::sync::Arc<GnssController>,
+        gnss: Arc<GnssController>,
     ) -> Self {
         let project = SdncProject::default();
         let project_file = base_dir.join("projet_terrain.sdnc.json");
@@ -164,11 +177,15 @@ impl SdncFieldApp {
         let cache_db = base_dir.join(&project.basemap.tile_cache_rel_path);
         let _ = tile_client.enable_disk_cache(&cache_db);
 
-        let terrain_engine = VulkanTerrainEngine::new();
-        let gpu_label = format!(
-            "{} ({})",
-            terrain_engine.backend_info.adapter_name, terrain_engine.backend_info.backend_name
-        );
+        let gpu_backend_label = VulkanComputeContext::try_new()
+            .map(|c| format!("{} ({})", c.info.adapter_name, c.info.backend_name))
+            .unwrap_or_else(|_| {
+                if wgpu_target_format.is_some() {
+                    "WGPU / Vulkan 2D".to_string()
+                } else {
+                    "CPU 2D Fallback".to_string()
+                }
+            });
 
         let mut app = Self {
             project,
@@ -177,7 +194,6 @@ impl SdncFieldApp {
             layers: Vec::new(),
             active_layer_idx: 0,
             undo_stack: Vec::new(),
-            view_mode: ViewMode::Map2D,
             active_tool: MapTool::Navigate,
             show_layers_panel: true,
             show_gnss_panel: true,
@@ -185,12 +201,18 @@ impl SdncFieldApp {
             snapping_enabled: true,
             snapping_radius_px: 14.0,
             tile_client,
-            terrain_engine,
-            lidar_cloud: sdnc_gpu::LidarCloudData::default(),
-            lidar_point_size_px: 3.0,
+            gpu_backend_label: gpu_backend_label.clone(),
             wgpu_target_format,
+            vector_gpu_batch: Vector2dGpuBatch::default(),
+            vector_gpu_dirty: true,
             vp2d: Viewport2dState::default(),
-            vp3d: Viewport3dState::default(),
+            last_view_wgs84_bbox: None,
+            wfs_selected_layers: vec![
+                IgnWfsLayer::ParcellaireParcelles,
+                IgnWfsLayer::ParcellaireBatiments,
+            ],
+            wfs_loading: Arc::new(AtomicBool::new(false)),
+            wfs_inbox: Arc::new(Mutex::new(Vec::new())),
             gnss,
             averaging: None,
             avg_target_epochs: 10,
@@ -212,7 +234,7 @@ impl SdncFieldApp {
             pending_form: None,
             identified_info: None,
             search_query: String::new(),
-            status_banner: format!("SDNCQField Rust prêt | Compute : {}", gpu_label),
+            status_banner: format!("SDNCQField-RS 2D prêt | GPU : {}", gpu_backend_label),
             mobile_layout_initialized: false,
         };
 
@@ -220,44 +242,306 @@ impl SdncFieldApp {
         app
     }
 
-    pub fn load_demo_lidar_cloud(&mut self, num_points: usize) {
+    pub fn mark_vector_gpu_dirty(&mut self) {
+        self.vector_gpu_dirty = true;
+    }
+
+    /// Reconstruit le batch VRAM 2D (`FillVertex2d` triangulés + `Segment2dGpu` instanciés)
+    /// uniquement lorsque les couches, la visibilité ou le CRS changent.
+    pub fn rebuild_vector_gpu_batch(&mut self) {
+        let active_crs = self.project.active_crs;
+        let origin_xy = if let Some((x0, y0, x1, y1)) = self.compute_layers_bbox() {
+            [(x0 + x1) * 0.5, (y0 + y1) * 0.5]
+        } else if let Some((cx, cy)) = self.project.center_xy {
+            [cx, cy]
+        } else {
+            [700_000.0, 6_600_000.0]
+        };
+
+        let mut fill_vertices: Vec<FillVertex2d> = Vec::new();
+        let mut segments: Vec<Segment2dGpu> = Vec::new();
+
+        for layer in &self.layers {
+            if !layer.spec.visible {
+                continue;
+            }
+            let s = &layer.spec.style;
+            let alpha_mul = layer.spec.opacity.clamp(0.0, 1.0);
+            let stroke_rgba = [
+                s.stroke_rgba[0],
+                s.stroke_rgba[1],
+                s.stroke_rgba[2],
+                (s.stroke_rgba[3] as f32 * alpha_mul) as u8,
+            ];
+            let fill_rgba = [
+                s.fill_rgba[0],
+                s.fill_rgba[1],
+                s.fill_rgba[2],
+                (s.fill_rgba[3] as f32 * alpha_mul) as u8,
+            ];
+            let stroke_u32 = pack_rgba8(stroke_rgba);
+            let fill_u32 = pack_rgba8(fill_rgba);
+            let draw_fill = fill_rgba[3] > 0;
+            let draw_stroke = stroke_rgba[3] > 0 && s.stroke_width > 0.0;
+            let width_px = s.stroke_width.max(1.0);
+
+            for feat in &layer.data.features {
+                let Some(geom) = &feat.geometry else {
+                    continue;
+                };
+                append_geometry_to_gpu_batch(
+                    geom,
+                    layer.spec.crs,
+                    active_crs,
+                    origin_xy,
+                    fill_u32,
+                    stroke_u32,
+                    width_px,
+                    draw_fill,
+                    draw_stroke,
+                    &mut fill_vertices,
+                    &mut segments,
+                );
+            }
+        }
+
+        let next_gen = self.vector_gpu_batch.generation.wrapping_add(1).max(1);
+        self.vector_gpu_batch = Vector2dGpuBatch {
+            origin_xy,
+            fill_vertices: Arc::new(fill_vertices),
+            segments: Arc::new(segments),
+            generation: next_gen,
+        };
+        self.vector_gpu_dirty = false;
+    }
+
+    /// Charge un îlot cadastral français de démonstration (Section AB, Parcelles, Bâtiments concaves L/U, Bornes).
+    pub fn load_demo_cadastre(&mut self) {
         let (cx, cy) = self.project.center_xy.unwrap_or((894500.0, 6269500.0));
-        let next_gen = self.lidar_cloud.generation + 1;
-        self.lidar_cloud =
-            sdnc_gpu::generate_synthetic_lidar_cloud(cx, cy, 245.0, 420.0, num_points, next_gen);
-        self.view_mode = ViewMode::Surface3D;
+        let crs = self.project.active_crs;
+        self.layers.retain(|l| !l.spec.id.starts_with("demo_cad_"));
+
+        let demo_layers = generate_demo_cadastral_layers(cx, cy, crs);
+        let mut total_feats = 0usize;
+        for (spec, fc) in demo_layers {
+            total_feats += fc.features.len();
+            self.layers.push(RuntimeLayer {
+                spec,
+                data: fc,
+                dirty: false,
+            });
+        }
+        self.project.center_xy = Some((cx, cy));
+        self.vp2d.pan_offset = egui::Vec2::ZERO;
+        self.vp2d.zoom_level = 1.0;
+        self.mark_vector_gpu_dirty();
         self.status_banner = format!(
-            "Nuage LiDAR GPU chargé ({} points -> rendu natif egui_wgpu::Callback)",
-            num_points
+            "Plan cadastral démo chargé ({} entités PCI : Section AB, Parcelles, Bâtis L/U, Bornes)",
+            total_feats
         );
     }
 
-    pub fn import_lidar_file(&mut self, path: &Path) {
-        let next_gen = self.lidar_cloud.generation + 1;
-        let ext = path
-            .extension()
-            .and_then(|s| s.to_str())
-            .unwrap_or("")
-            .to_lowercase();
-        let res = if ext == "las" {
-            sdnc_gpu::load_las_point_cloud(path, 4_000_000, next_gen)
-        } else {
-            sdnc_gpu::load_xyz_point_cloud(path, next_gen)
-        };
-        match res {
-            Ok(cloud) => {
-                let n = cloud.points.len();
-                self.lidar_cloud = cloud;
-                self.view_mode = ViewMode::Surface3D;
+    /// Importe un plan cadastral **DXF ou DXF-PCI** découpé par calques avec détection CRS et couleurs DGFiP/ACI.
+    pub fn import_cadastral_dxf(&mut self, path: &Path) {
+        match load_dxf_cadastral_layers(path, self.project.active_crs) {
+            Ok((detected_crs, cad_layers)) => {
+                let n_layers = cad_layers.len();
+                let mut total_feats = 0usize;
+                for (spec, fc) in cad_layers {
+                    total_feats += fc.features.len();
+                    self.layers.push(RuntimeLayer {
+                        spec,
+                        data: fc,
+                        dirty: false,
+                    });
+                }
+                self.project.active_crs = detected_crs;
+                if let Some((x0, y0, x1, y1)) = self.compute_layers_bbox() {
+                    self.project.center_xy = Some(((x0 + x1) * 0.5, (y0 + y1) * 0.5));
+                }
+                self.vp2d.pan_offset = egui::Vec2::ZERO;
+                self.vp2d.zoom_level = 1.0;
+                self.mark_vector_gpu_dirty();
                 self.status_banner = format!(
-                    "Nuage LiDAR .{} importé ({} points VRAM GPU)",
-                    ext.to_uppercase(),
-                    n
+                    "Cadastre DXF/DXF-PCI importé : {} calques, {} entités (EPSG:{})",
+                    n_layers,
+                    total_feats,
+                    detected_crs.epsg()
                 );
             }
             Err(e) => {
-                self.status_banner = format!("Erreur import nuage LiDAR : {}", e);
+                self.status_banner = format!("Erreur import DXF/DXF-PCI : {}", e);
             }
+        }
+    }
+
+    /// Importe un lot cadastral **EDIGÉO** (fichier `.THF` ou dossier) avec topologie NF Z 52-000 & symbologie DGFiP.
+    pub fn import_cadastral_edigeo(&mut self, path: &Path) {
+        match load_edigeo_cadastral_layers(path, self.project.active_crs) {
+            Ok((detected_crs, cad_layers)) => {
+                let n_layers = cad_layers.len();
+                let mut total_feats = 0usize;
+                for (spec, fc) in cad_layers {
+                    total_feats += fc.features.len();
+                    self.layers.push(RuntimeLayer {
+                        spec,
+                        data: fc,
+                        dirty: false,
+                    });
+                }
+                self.project.active_crs = detected_crs;
+                if let Some((x0, y0, x1, y1)) = self.compute_layers_bbox() {
+                    self.project.center_xy = Some(((x0 + x1) * 0.5, (y0 + y1) * 0.5));
+                }
+                self.vp2d.pan_offset = egui::Vec2::ZERO;
+                self.vp2d.zoom_level = 1.0;
+                self.mark_vector_gpu_dirty();
+                self.status_banner = format!(
+                    "Cadastre EDIGÉO importé : {} couches DGFiP, {} objets (EPSG:{})",
+                    n_layers,
+                    total_feats,
+                    detected_crs.epsg()
+                );
+            }
+            Err(e) => {
+                self.status_banner = format!("Erreur import EDIGÉO : {}", e);
+            }
+        }
+    }
+
+    /// Lance le téléchargement asynchrone des flux **IGN Géoplateforme Vecteur (WFS 2.0 GeoJSON)**
+    /// sur l'emprise 2D actuellement affichée à l'écran.
+    pub fn request_ign_wfs_for_current_view(&mut self, ctx: egui::Context) {
+        if self.wfs_selected_layers.is_empty() {
+            self.status_banner = "Sélectionnez au moins une couche IGN WFS à charger".to_string();
+            return;
+        }
+        if self.wfs_loading.swap(true, Ordering::SeqCst) {
+            return;
+        }
+        let Some((mut min_lon, mut min_lat, mut max_lon, mut max_lat)) = self.last_view_wgs84_bbox
+        else {
+            self.wfs_loading.store(false, Ordering::SeqCst);
+            self.status_banner = "Emprise 2D indisponible pour la requête IGN WFS".to_string();
+            return;
+        };
+
+        // Limiter l'emprise WFS à ~4 km autour du centre si l'utilisateur est très dézoomé
+        let max_span_deg = 0.04;
+        if (max_lon - min_lon) > max_span_deg {
+            let cx = 0.5 * (min_lon + max_lon);
+            min_lon = cx - max_span_deg * 0.5;
+            max_lon = cx + max_span_deg * 0.5;
+        }
+        if (max_lat - min_lat) > max_span_deg {
+            let cy = 0.5 * (min_lat + max_lat);
+            min_lat = cy - max_span_deg * 0.5;
+            max_lat = cy + max_span_deg * 0.5;
+        }
+
+        let layers_to_fetch = self.wfs_selected_layers.clone();
+        let inbox = Arc::clone(&self.wfs_inbox);
+        let loading = Arc::clone(&self.wfs_loading);
+        self.status_banner = format!(
+            "Chargement IGN WFS ({} couche(s)) sur la vue courante...",
+            layers_to_fetch.len()
+        );
+
+        std::thread::spawn(move || {
+            for layer in layers_to_fetch {
+                let res = fetch_ign_wfs_geojson(layer, min_lon, min_lat, max_lon, max_lat, 1500)
+                    .map_err(|e| e.to_string())
+                    .and_then(|body| {
+                        FeatureCollection::from_geojson(&body).map_err(|e| e.to_string())
+                    });
+                inbox
+                    .lock()
+                    .unwrap_or_else(|e| e.into_inner())
+                    .push((layer, res));
+                ctx.request_repaint();
+            }
+            loading.store(false, Ordering::SeqCst);
+            ctx.request_repaint();
+        });
+    }
+
+    /// Intègre les couches vectorielles IGN WFS reçues en arrière-plan (reprojection WGS84 → CRS actif).
+    pub fn poll_wfs_inbox(&mut self) {
+        let items: Vec<WfsInboxItem> = {
+            let mut guard = self.wfs_inbox.lock().unwrap_or_else(|e| e.into_inner());
+            if guard.is_empty() {
+                return;
+            }
+            std::mem::take(&mut *guard)
+        };
+
+        let active_crs = self.project.active_crs;
+        let mut total_added = 0usize;
+        let mut last_err: Option<String> = None;
+
+        for (wfs_layer, res) in items {
+            match res {
+                Ok(mut fc) => {
+                    // Les flux IGN WFS CRS:84 arrivent en (lon, lat) WGS84 -> reprojeter dans active_crs
+                    for feat in &mut fc.features {
+                        if let Some(ref mut g) = feat.geometry {
+                            reproject_geometry_from_wgs84(g, active_crs);
+                        }
+                    }
+                    let count = fc.features.len();
+                    total_added += count;
+
+                    let (stroke_rgba, fill_rgba, stroke_width, label_field) =
+                        wfs_layer.default_style();
+                    let table_name = format!("ign_wfs_{:?}", wfs_layer).to_lowercase();
+                    let spec = ProjectLayerSpec {
+                        id: table_name.clone(),
+                        name: wfs_layer.label().to_string(),
+                        source: LayerSource::GeoPackageTable {
+                            gpkg_rel_path: self.project.gpkg_file.clone(),
+                            table_name,
+                        },
+                        crs: active_crs,
+                        visible: true,
+                        editable: false,
+                        opacity: 1.0,
+                        style: LayerStyle {
+                            stroke_rgba,
+                            fill_rgba,
+                            stroke_width,
+                            point_radius: 4.0,
+                            label_field: label_field.map(|s| s.to_string()),
+                        },
+                        form_fields: sdnc_data::default_field_form(),
+                    };
+
+                    if let Some(existing) = self.layers.iter_mut().find(|l| l.spec.id == spec.id) {
+                        existing.spec.crs = active_crs;
+                        existing.data = fc;
+                        existing.dirty = true;
+                    } else {
+                        self.layers.push(RuntimeLayer {
+                            spec,
+                            data: fc,
+                            dirty: true,
+                        });
+                    }
+                    self.mark_vector_gpu_dirty();
+                }
+                Err(e) => {
+                    last_err = Some(format!("{} : {}", wfs_layer.label(), e));
+                }
+            }
+        }
+
+        if let Some(err) = last_err {
+            self.status_banner = format!("IGN WFS partiel/erreur — {}", err);
+        } else {
+            self.status_banner = format!(
+                "Flux Vecteurs IGN WFS chargés ({} entités en EPSG:{}, sauvegardables en .gpkg)",
+                total_added,
+                active_crs.epsg()
+            );
         }
     }
 
@@ -372,7 +656,6 @@ impl SdncFieldApp {
         let specs = self.project.layers.clone();
         for (idx, spec) in specs.into_iter().enumerate() {
             let mut fc = FeatureCollection::empty();
-            // Quelques entités exemples autour de Meyreuil / Aix-en-Provence (Lambert-93)
             if idx == 0 {
                 let mut f = Feature::with_geometry(Geometry::Point {
                     coordinates: Coordinate::new_3d(894510.0, 6269520.0, 242.5),
@@ -410,10 +693,10 @@ impl SdncFieldApp {
                 dirty: false,
             });
         }
-        self.vp3d.invalidate_terrain();
+        self.mark_vector_gpu_dirty();
     }
 
-    /// Sauvegarde le projet natif (`.sdnc.json`) + toutes les couches éditables dans le `.gpkg`.
+    /// Sauvegarde le projet natif (`.sdnc.json`) + toutes les couches GeoPackage (y compris IGN WFS).
     pub fn save_project(&mut self) {
         let gpkg_path = self.project.resolve_path(&self.project_dir, &self.project.gpkg_file);
         match GeoPackage::open(&gpkg_path) {
@@ -453,7 +736,7 @@ impl SdncFieldApp {
         }
     }
 
-    /// Charge un projet `.sdnc.json` et ses couches `.gpkg` / `.geojson` / `.dxf`.
+    /// Charge un projet `.sdnc.json` et ses couches `.gpkg` / `.geojson` / `.dxf` / EDIGÉO.
     pub fn load_project_file(&mut self, json_path: &Path) {
         match SdncProject::load(json_path) {
             Ok(proj) => {
@@ -506,7 +789,7 @@ impl SdncFieldApp {
                         dirty: false,
                     });
                 }
-                self.vp3d.invalidate_terrain();
+                self.mark_vector_gpu_dirty();
                 self.status_banner = format!(
                     "Projet '{}' chargé ({} couches)",
                     self.project.name,
@@ -517,8 +800,12 @@ impl SdncFieldApp {
         }
     }
 
-    /// Importe un fichier GeoPackage, GeoJSON ou DXF directement en nouvelle couche.
+    /// Importe un fichier GeoPackage, GeoJSON, DXF/DXF-PCI ou EDIGÉO (`.thf` ou dossier).
     pub fn import_vector_file(&mut self, path: &Path) {
+        if path.is_dir() {
+            self.import_cadastral_edigeo(path);
+            return;
+        }
         let ext = path
             .extension()
             .and_then(|e| e.to_str())
@@ -531,6 +818,8 @@ impl SdncFieldApp {
             .to_string();
 
         match ext.as_str() {
+            "dxf" => self.import_cadastral_dxf(path),
+            "thf" | "vec" | "geo" => self.import_cadastral_edigeo(path),
             "gpkg" => match GeoPackage::open(path) {
                 Ok(gpkg) => {
                     if let Ok(metas) = gpkg.list_layers() {
@@ -560,7 +849,7 @@ impl SdncFieldApp {
                                 added += 1;
                             }
                         }
-                        self.vp3d.invalidate_terrain();
+                        self.mark_vector_gpu_dirty();
                         self.status_banner =
                             format!("GeoPackage importé : {} couche(s) depuis {}", added, stem);
                     }
@@ -590,36 +879,10 @@ impl SdncFieldApp {
                         data: fc,
                         dirty: false,
                     });
-                    self.vp3d.invalidate_terrain();
+                    self.mark_vector_gpu_dirty();
                     self.status_banner = format!("GeoJSON '{}' importé ({} entités)", stem, count);
                 }
                 None => self.status_banner = format!("GeoJSON invalide: {:?}", path),
-            },
-            "dxf" => match sdnc_data::DxfParser::parse(path) {
-                Ok(doc) => {
-                    let fc = doc.to_feature_collection(None);
-                    let count = fc.features.len();
-                    self.layers.push(RuntimeLayer {
-                        spec: ProjectLayerSpec {
-                            id: format!("dxf_{}", stem),
-                            name: format!("{} (DXF)", stem),
-                            source: LayerSource::DxfFile {
-                                rel_path: path.to_string_lossy().to_string(),
-                            },
-                            crs: self.project.active_crs,
-                            visible: true,
-                            editable: false,
-                            opacity: 1.0,
-                            style: Default::default(),
-                            form_fields: sdnc_data::default_field_form(),
-                        },
-                        data: fc,
-                        dirty: false,
-                    });
-                    self.vp3d.invalidate_terrain();
-                    self.status_banner = format!("DXF '{}' importé ({} entités)", stem, count);
-                }
-                Err(e) => self.status_banner = format!("Erreur DXF: {}", e),
             },
             _ => {
                 self.status_banner = format!("Format non reconnu : .{}", ext);
@@ -690,8 +953,9 @@ impl SdncFieldApp {
             feat.set_property("horodatage", chrono::Utc::now().to_rfc3339());
             layer.data.add_feature(feat);
             layer.dirty = true;
-            self.vp3d.invalidate_terrain();
-            self.status_banner = format!("Entité ajoutée dans '{}'", layer.spec.name);
+            let name = layer.spec.name.clone();
+            self.mark_vector_gpu_dirty();
+            self.status_banner = format!("Entité ajoutée dans '{}'", name);
         }
     }
 
@@ -700,8 +964,9 @@ impl SdncFieldApp {
             if let Some(layer) = self.layers.get_mut(idx) {
                 layer.data = prev_fc;
                 layer.dirty = true;
-                self.vp3d.invalidate_terrain();
-                self.status_banner = format!("Dernière modification annulée ({})", layer.spec.name);
+                let name = layer.spec.name.clone();
+                self.mark_vector_gpu_dirty();
+                self.status_banner = format!("Dernière modification annulée ({})", name);
             }
         }
     }
@@ -772,7 +1037,7 @@ impl SdncFieldApp {
                 visible: true,
                 editable: true,
                 opacity: 1.0,
-                style: sdnc_data::LayerStyle {
+                style: LayerStyle {
                     stroke_rgba: [40, 240, 120, 255],
                     fill_rgba: [40, 240, 120, 180],
                     stroke_width: 2.5,
@@ -784,7 +1049,7 @@ impl SdncFieldApp {
             data: fc,
             dirty: true,
         });
-        self.vp3d.invalidate_terrain();
+        self.mark_vector_gpu_dirty();
         self.status_banner = format!(
             "Trajectoire PPK ({} époques) ajoutée au projet (prête à sauvegarder en .gpkg)",
             report.total_epochs
@@ -809,52 +1074,171 @@ impl SdncFieldApp {
         self.gnss.run_ppk_files_async(job);
     }
 
-    /// Collecte tous les points 3D projetés dans le CRS actif (pour l'emprise et le MNT Vulkan Compute).
-    pub fn collect_elevation_samples(&self) -> Vec<(f64, f64, f64, f32)> {
+    /// Calcule la boîte englobante 2D `(min_x, min_y, max_x, max_y)` de toutes les couches visibles dans le CRS actif.
+    pub fn compute_layers_bbox(&self) -> Option<(f64, f64, f64, f64)> {
         let active_crs = self.project.active_crs;
-        let mut pts = Vec::new();
+        let mut min_x = f64::MAX;
+        let mut max_x = f64::MIN;
+        let mut min_y = f64::MAX;
+        let mut max_y = f64::MIN;
+
         for layer in &self.layers {
             if !layer.spec.visible {
                 continue;
             }
             for f in &layer.data.features {
                 if let Some(g) = &f.geometry {
-                    collect_geom_coords(g, layer.spec.crs, active_crs, &mut pts);
+                    if let Some((x0, y0, x1, y1)) = g.bbox() {
+                        for (cx, cy) in [(x0, y0), (x1, y1)] {
+                            let (px, py) = if layer.spec.crs != active_crs {
+                                reproject_point_3d(layer.spec.crs, active_crs, cx, cy, 0.0)
+                                    .map(|(a, b, _)| (a, b))
+                                    .unwrap_or((cx, cy))
+                            } else {
+                                (cx, cy)
+                            };
+                            if px.is_finite() && py.is_finite() {
+                                min_x = min_x.min(px);
+                                max_x = max_x.max(px);
+                                min_y = min_y.min(py);
+                                max_y = max_y.max(py);
+                            }
+                        }
+                    }
                 }
             }
         }
-        pts
+
+        if min_x <= max_x && min_y <= max_y {
+            Some((min_x, min_y, max_x, max_y))
+        } else {
+            None
+        }
     }
 }
 
-fn collect_geom_coords(
-    g: &Geometry,
+#[allow(clippy::too_many_arguments)]
+fn append_geometry_to_gpu_batch(
+    geom: &Geometry,
     src_crs: FrenchCrs,
     dst_crs: FrenchCrs,
-    out: &mut Vec<(f64, f64, f64, f32)>,
+    origin_xy: [f64; 2],
+    fill_rgba: u32,
+    stroke_rgba: u32,
+    width_px: f32,
+    draw_fill: bool,
+    draw_stroke: bool,
+    fill_out: &mut Vec<FillVertex2d>,
+    seg_out: &mut Vec<Segment2dGpu>,
 ) {
-    let mut push_c = |c: &Coordinate| {
-        let z = c.z.unwrap_or(240.0);
-        let (x, y, z2) = if src_crs != dst_crs {
-            reproject_point_3d(src_crs, dst_crs, c.x, c.y, z).unwrap_or((c.x, c.y, z))
+    let to_rel = |c: &Coordinate| -> (f32, f32) {
+        let (x, y) = if src_crs != dst_crs {
+            reproject_point_3d(src_crs, dst_crs, c.x, c.y, c.z.unwrap_or(0.0))
+                .map(|(rx, ry, _)| (rx, ry))
+                .unwrap_or((c.x, c.y))
         } else {
-            (c.x, c.y, z)
+            (c.x, c.y)
         };
-        if x.is_finite() && y.is_finite() && z2.is_finite() {
-            out.push((x, y, z2, 5.0));
+        ((x - origin_xy[0]) as f32, (y - origin_xy[1]) as f32)
+    };
+
+    let push_polyline = |coords: &[Coordinate], segs: &mut Vec<Segment2dGpu>| {
+        if coords.len() < 2 || !draw_stroke {
+            return;
+        }
+        let mut prev = to_rel(&coords[0]);
+        for c in coords.iter().skip(1) {
+            let next = to_rel(c);
+            if (next.0 - prev.0).hypot(next.1 - prev.1) > 1e-5 {
+                segs.push(Segment2dGpu {
+                    x0: prev.0,
+                    y0: prev.1,
+                    x1: next.0,
+                    y1: next.1,
+                    width_px,
+                    rgba: stroke_rgba,
+                    pad0: 0,
+                    pad1: 0,
+                });
+            }
+            prev = next;
         }
     };
-    match g {
-        Geometry::Point { coordinates } => push_c(coordinates),
+
+    match geom {
+        Geometry::Point { .. } | Geometry::MultiPoint { .. } => {
+            // Les points et textes cadastraux sont rendus avec culling viewport dans viewport_2d.rs
+        }
+        Geometry::LineString { coordinates } => {
+            push_polyline(coordinates, seg_out);
+        }
+        Geometry::MultiLineString { coordinates } => {
+            for line in coordinates {
+                push_polyline(line, seg_out);
+            }
+        }
+        Geometry::Polygon { coordinates } => {
+            if let Some(ext) = coordinates.first() {
+                if draw_fill && ext.len() >= 3 {
+                    let rel_ring: Vec<(f32, f32)> = ext.iter().map(to_rel).collect();
+                    triangulate_polygon_earclip(&rel_ring, fill_rgba, fill_out);
+                }
+            }
+            for ring in coordinates {
+                push_polyline(ring, seg_out);
+            }
+        }
+        Geometry::MultiPolygon { coordinates } => {
+            for poly in coordinates {
+                if let Some(ext) = poly.first() {
+                    if draw_fill && ext.len() >= 3 {
+                        let rel_ring: Vec<(f32, f32)> = ext.iter().map(to_rel).collect();
+                        triangulate_polygon_earclip(&rel_ring, fill_rgba, fill_out);
+                    }
+                }
+                for ring in poly {
+                    push_polyline(ring, seg_out);
+                }
+            }
+        }
+        Geometry::GeometryCollection { geometries } => {
+            for sub in geometries {
+                append_geometry_to_gpu_batch(
+                    sub,
+                    src_crs,
+                    dst_crs,
+                    origin_xy,
+                    fill_rgba,
+                    stroke_rgba,
+                    width_px,
+                    draw_fill,
+                    draw_stroke,
+                    fill_out,
+                    seg_out,
+                );
+            }
+        }
+    }
+}
+
+fn reproject_geometry_from_wgs84(geom: &mut Geometry, dst_crs: FrenchCrs) {
+    let proj_c = |c: &mut Coordinate| {
+        if let Ok((x, y)) = from_wgs84(dst_crs, c.x, c.y) {
+            c.x = x;
+            c.y = y;
+        }
+    };
+    match geom {
+        Geometry::Point { coordinates } => proj_c(coordinates),
         Geometry::LineString { coordinates } | Geometry::MultiPoint { coordinates } => {
             for c in coordinates {
-                push_c(c);
+                proj_c(c);
             }
         }
         Geometry::Polygon { coordinates } | Geometry::MultiLineString { coordinates } => {
             for ring in coordinates {
                 for c in ring {
-                    push_c(c);
+                    proj_c(c);
                 }
             }
         }
@@ -862,14 +1246,14 @@ fn collect_geom_coords(
             for poly in coordinates {
                 for ring in poly {
                     for c in ring {
-                        push_c(c);
+                        proj_c(c);
                     }
                 }
             }
         }
         Geometry::GeometryCollection { geometries } => {
             for sub in geometries {
-                collect_geom_coords(sub, src_crs, dst_crs, out);
+                reproject_geometry_from_wgs84(sub, dst_crs);
             }
         }
     }

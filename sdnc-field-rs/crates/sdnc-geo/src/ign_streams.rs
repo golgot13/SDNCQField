@@ -24,6 +24,8 @@ pub enum BasemapLayerType {
     IgnOrtho,
     IgnPlan,
     IgnCadastre,
+    IgnParcellaireExpress,
+    IgnEstompage,
     IgnAltimetrieMnt,
     OpenStreetMap,
 }
@@ -31,9 +33,11 @@ pub enum BasemapLayerType {
 impl BasemapLayerType {
     pub fn label(&self) -> &'static str {
         match self {
-            Self::IgnOrtho => "IGN Orthophoto HD",
+            Self::IgnOrtho => "IGN BD ORTHO HD",
             Self::IgnPlan => "Plan IGN v2",
-            Self::IgnCadastre => "Cadastre IGN",
+            Self::IgnCadastre => "Cadastre PCI Image (IGN)",
+            Self::IgnParcellaireExpress => "Parcellaire Express PCI (IGN)",
+            Self::IgnEstompage => "Estompage Relief (IGN)",
             Self::IgnAltimetrieMnt => "MNT Altimétrie IGN",
             Self::OpenStreetMap => "OpenStreetMap",
         }
@@ -44,6 +48,8 @@ impl BasemapLayerType {
             Self::IgnOrtho => "ORTHOIMAGERY.ORTHOPHOTOS",
             Self::IgnPlan => "GEOGRAPHICALGRIDSYSTEMS.PLANIGNV2",
             Self::IgnCadastre => "CADASTRALPARCELS.PARCELS",
+            Self::IgnParcellaireExpress => "CADASTRALPARCELS.PARCELLAIRE_EXPRESS",
+            Self::IgnEstompage => "ELEVATION.ELEVATIONGRIDCOVERAGE.SHADOW",
             Self::IgnAltimetrieMnt => "ELEVATION.ELEVATIONGRIDCOVERAGE",
             Self::OpenStreetMap => "OSM.STANDARD",
         }
@@ -52,7 +58,11 @@ impl BasemapLayerType {
     pub fn format_ext(&self) -> &'static str {
         match self {
             Self::IgnOrtho => "jpeg",
-            Self::IgnPlan | Self::IgnCadastre | Self::OpenStreetMap => "png",
+            Self::IgnPlan
+            | Self::IgnCadastre
+            | Self::IgnParcellaireExpress
+            | Self::IgnEstompage
+            | Self::OpenStreetMap => "png",
             Self::IgnAltimetrieMnt => "x-bil;bits=32",
         }
     }

@@ -121,7 +121,27 @@ pub fn render_viewport_2d(
         (wx, wy)
     };
 
-    // 3. Fond de carte WMTS IGN / OSM avec reprojection par maillage 4x4 (d'AEROPHOTOGRAM)
+    // 3. Mise à jour de l'emprise WGS84 visible (pour requêtes IGN WFS sur la vue)
+    let (v_min_x, v_max_y) = screen_to_world(rect.min);
+    let (v_max_x, v_min_y) = screen_to_world(rect.max);
+    let view_min_x = v_min_x.min(v_max_x);
+    let view_max_x = v_min_x.max(v_max_x);
+    let view_min_y = v_min_y.min(v_max_y);
+    let view_max_y = v_min_y.max(v_max_y);
+    {
+        let (lon0, lat0) = to_wgs84_robust(active_crs, view_min_x, view_min_y);
+        let (lon1, lat1) = to_wgs84_robust(active_crs, view_max_x, view_max_y);
+        if (lon0 != 0.0 || lat0 != 0.0) && (lon1 != 0.0 || lat1 != 0.0) {
+            app.last_view_wgs84_bbox = Some((
+                lon0.min(lon1),
+                lat0.min(lat1),
+                lon0.max(lon1),
+                lat0.max(lat1),
+            ));
+        }
+    }
+
+    // 4. Fond de carte WMTS IGN / OSM avec reprojection par maillage 4x4 (d'AEROPHOTOGRAM)
     render_basemap_tiles(
         ui,
         &painter,
@@ -133,13 +153,56 @@ pub fn render_viewport_2d(
         app,
     );
 
-    // 4. Carroyage métrique adaptatif
+    // 5. Carroyage métrique adaptatif
     if app.vp2d.show_grid {
         render_metric_grid(&painter, rect, &screen_to_world, &world_to_screen, scale);
     }
 
-    // 5. Rendu de toutes les couches vectorielles (GeoPackage / GeoJSON / DXF / EDIGÉO)
+    // 6. Rendu GPU natif Vulkan/WGPU de toutes les couches vectorielles & cadastrales 2D
+    //    (polygones concaves triangulés + segments instanciés anti-aliasés en 2 draw calls)
+    if app.vector_gpu_dirty {
+        app.rebuild_vector_gpu_batch();
+    }
+
+    let used_gpu_vectors = if let Some(target_format) = app.wgpu_target_format {
+        if !app.vector_gpu_batch.fill_vertices.is_empty()
+            || !app.vector_gpu_batch.segments.is_empty()
+        {
+            let cam = sdnc_gpu::Camera2dUniform {
+                shift_x: (app.vector_gpu_batch.origin_xy[0] - base_cx) as f32,
+                shift_y: (app.vector_gpu_batch.origin_xy[1] - base_cy) as f32,
+                scale: scale as f32,
+                pad0: 0.0,
+                viewport_w: rect.width().max(1.0),
+                viewport_h: rect.height().max(1.0),
+                pan_x: pan.x,
+                pan_y: pan.y,
+            };
+            let cb = sdnc_gpu::Vector2dWgpuCallback {
+                batch: app.vector_gpu_batch.clone(),
+                camera: cam,
+                target_format,
+            };
+            painter.add(egui_wgpu::Callback::new_paint_callback(rect, cb));
+        }
+        true
+    } else {
+        false
+    };
+
+    // 7. Rendu CPU des points, textes DXF/EDIGÉO, étiquettes parcelles (avec culling viewport)
+    //    + repli CPU des polygones/lignes si WGPU absent + collecte snapping uniquement si outil saisie actif
+    let need_snap = app.snapping_enabled
+        && matches!(
+            app.active_tool,
+            MapTool::DigitizePoint | MapTool::DigitizeLine | MapTool::DigitizePolygon
+        );
     let mut snap_candidates: Vec<(Pos2, Coordinate)> = Vec::new();
+    let meters_per_px = 1.0 / scale.max(1e-6);
+    let show_cadastre_labels = meters_per_px < 4.0;
+    let mut labels_drawn = 0usize;
+    const MAX_LABELS_PER_FRAME: usize = 350;
+
     for layer in &app.layers {
         if !layer.spec.visible {
             continue;
@@ -164,40 +227,86 @@ pub fn render_viewport_2d(
             let Some(geom) = &feat.geometry else {
                 continue;
             };
-            let label = s
-                .label_field
-                .as_ref()
-                .and_then(|fld| feat.get_string(fld));
-            draw_geometry_2d(
-                &painter,
-                geom,
-                layer.spec.crs,
-                active_crs,
-                &world_to_screen,
-                stroke,
-                fill_col,
-                s.point_radius,
-                label,
-                &mut snap_candidates,
-            );
+            // Culling frustum rapide sur la bbox de l'entité (en CRS actif si identique)
+            if layer.spec.crs == active_crs {
+                if let Some((bx0, by0, bx1, by1)) = geom.bbox() {
+                    if bx1 < view_min_x || bx0 > view_max_x || by1 < view_min_y || by0 > view_max_y {
+                        continue;
+                    }
+                }
+            }
+
+            let label = if show_cadastre_labels && labels_drawn < MAX_LABELS_PER_FRAME {
+                s.label_field
+                    .as_ref()
+                    .and_then(|fld| feat.get_string(fld))
+                    .or_else(|| feat.get_string("text"))
+            } else {
+                None
+            };
+
+            let is_dxf_text = feat
+                .get_string("type")
+                .map(|t| t == "Text" || t == "MText")
+                .unwrap_or(false);
+
+            if !used_gpu_vectors {
+                draw_geometry_2d(
+                    &painter,
+                    geom,
+                    layer.spec.crs,
+                    active_crs,
+                    &world_to_screen,
+                    stroke,
+                    fill_col,
+                    s.point_radius,
+                    label,
+                    if need_snap {
+                        Some(&mut snap_candidates)
+                    } else {
+                        None
+                    },
+                    is_dxf_text,
+                );
+                if label.is_some() {
+                    labels_drawn += 1;
+                }
+            } else {
+                // En mode GPU Vulkan, les polygones et lignes sont déjà dessinés en VRAM :
+                // on ne dessine sur Painter que les points, textes DXF/EDIGÉO et étiquettes visibles
+                draw_points_and_labels_2d(
+                    &painter,
+                    rect,
+                    geom,
+                    layer.spec.crs,
+                    active_crs,
+                    &world_to_screen,
+                    stroke,
+                    fill_col,
+                    s.point_radius,
+                    label,
+                    is_dxf_text,
+                    if need_snap && snap_candidates.len() < 4000 {
+                        Some(&mut snap_candidates)
+                    } else {
+                        None
+                    },
+                    &mut labels_drawn,
+                );
+            }
         }
     }
 
-    // 6. Surimpression GNSS RTK / PPK (Base + Ligne de base + Trace colorée + Rover + Cercle σ)
+    // 8. Surimpression GNSS RTK / PPK (Base + Ligne de base + Trace colorée + Rover + Cercle σ)
     render_gnss_overlay_2d(&painter, active_crs, scale, &world_to_screen, gnss_tel);
 
-    // 7. Curseur, Accrochage (Snapping) et Gestion des clics (Mesure / Saisie / Identification)
+    // 9. Curseur, Accrochage (Snapping) et Gestion des clics (Mesure / Saisie / Identification)
     let mut snapped_world: Option<Coordinate> = None;
     if let Some(hover) = response.hover_pos() {
         let (wx, wy) = screen_to_world(hover);
         app.vp2d.hovered_world = Some((wx, wy));
 
-        if app.snapping_enabled
-            && matches!(
-                app.active_tool,
-                MapTool::DigitizePoint | MapTool::DigitizeLine | MapTool::DigitizePolygon
-            )
-        {
+        if need_snap {
             let mut best: Option<(f32, Pos2, Coordinate)> = None;
             for &(sp, c) in &snap_candidates {
                 let d = sp.distance(hover);
@@ -215,11 +324,11 @@ pub fn render_viewport_2d(
         let cross_col = Color32::from_rgba_unmultiplied(0, 240, 255, 110);
         painter.line_segment(
             [Pos2::new(hover.x - 12.0, hover.y), Pos2::new(hover.x + 12.0, hover.y)],
-            (1.0, cross_col),
+            Stroke::new(1.0_f32, cross_col),
         );
         painter.line_segment(
             [Pos2::new(hover.x, hover.y - 12.0), Pos2::new(hover.x, hover.y + 12.0)],
-            (1.0, cross_col),
+            Stroke::new(1.0_f32, cross_col),
         );
     }
 
@@ -233,7 +342,8 @@ pub fn render_viewport_2d(
             match app.active_tool {
                 MapTool::Navigate => {}
                 MapTool::Identify => {
-                    app.identified_info = identify_nearest_feature(app, active_crs, click_pos, &world_to_screen);
+                    app.identified_info =
+                        identify_nearest_feature(app, active_crs, click_pos, &world_to_screen);
                 }
                 MapTool::MeasureDistance | MapTool::MeasureArea => {
                     app.vp2d.measure_points.push((coord.x, coord.y));
@@ -258,7 +368,12 @@ pub fn render_viewport_2d(
             MapTool::DigitizePolygon if app.draft_vertices.len() >= 3 => {
                 let mut ring = std::mem::take(&mut app.draft_vertices);
                 ring.push(ring[0]);
-                app.open_attribute_form(Geometry::Polygon { coordinates: vec![ring] }, gnss_tel);
+                app.open_attribute_form(
+                    Geometry::Polygon {
+                        coordinates: vec![ring],
+                    },
+                    gnss_tel,
+                );
             }
             MapTool::MeasureDistance | MapTool::MeasureArea => {
                 app.vp2d.measure_points.clear();
@@ -267,10 +382,10 @@ pub fn render_viewport_2d(
         }
     }
 
-    // 8. Rendu du brouillon de numérisation (Rubberband) & des mesures
+    // 10. Rendu du brouillon de numérisation (Rubberband) & des mesures
     render_draft_and_measures(&painter, app, &world_to_screen);
 
-    // 9. HUD Cartographique (Flèche Nord convergence méridien, Échelle dynamique, Coordonnées)
+    // 11. HUD Cartographique (Flèche Nord convergence méridien, Échelle dynamique, Coordonnées + GPU)
     render_hud_2d(&painter, rect, active_crs, scale, app, gnss_tel);
 
     // Boutons flottants tactiles (+ / - / Recentrer / Finir saisie)
@@ -326,23 +441,14 @@ pub fn render_viewport_2d(
 
 fn compute_reference_extent(app: &SdncFieldApp, gnss_tel: &GnssLiveTelemetry) -> (f64, f64, f64) {
     let active_crs = app.project.active_crs;
-    let mut min_x = f64::MAX;
-    let mut max_x = f64::MIN;
-    let mut min_y = f64::MAX;
-    let mut max_y = f64::MIN;
 
-    for (x, y, _, _) in app.collect_elevation_samples() {
-        min_x = min_x.min(x);
-        max_x = max_x.max(x);
-        min_y = min_y.min(y);
-        max_y = max_y.max(y);
-    }
-
-    if min_x < max_x && min_y < max_y {
-        let cx = (min_x + max_x) * 0.5;
-        let cy = (min_y + max_y) * 0.5;
-        let span = (max_x - min_x).max(max_y - min_y).max(200.0) * 1.4;
-        return (cx, cy, span);
+    if let Some((min_x, min_y, max_x, max_y)) = app.compute_layers_bbox() {
+        if min_x < max_x || min_y < max_y {
+            let cx = (min_x + max_x) * 0.5;
+            let cy = (min_y + max_y) * 0.5;
+            let span = (max_x - min_x).max(max_y - min_y).max(160.0) * 1.35;
+            return (cx, cy, span);
+        }
     }
 
     if gnss_tel.solution.quality != FixQuality::NoFix {
@@ -356,7 +462,7 @@ fn compute_reference_extent(app: &SdncFieldApp, gnss_tel: &GnssLiveTelemetry) ->
     }
 
     if let Some((cx, cy)) = app.project.center_xy {
-        return (cx, cy, 800.0);
+        return (cx, cy, 600.0);
     }
     (700_000.0, 6_600_000.0, 2000.0)
 }
@@ -575,8 +681,9 @@ fn render_metric_grid(
 }
 
 #[allow(clippy::too_many_arguments)]
-fn draw_geometry_2d(
+fn draw_points_and_labels_2d(
     painter: &egui::Painter,
+    rect: Rect,
     geom: &Geometry,
     src_crs: FrenchCrs,
     dst_crs: FrenchCrs,
@@ -585,7 +692,9 @@ fn draw_geometry_2d(
     fill: Color32,
     point_radius: f32,
     label: Option<&str>,
-    snap_out: &mut Vec<(Pos2, Coordinate)>,
+    is_dxf_text: bool,
+    mut snap_out: Option<&mut Vec<(Pos2, Coordinate)>>,
+    labels_drawn: &mut usize,
 ) {
     let proj = |c: &Coordinate| -> (Pos2, Coordinate) {
         let (x, y) = if src_crs != dst_crs {
@@ -601,17 +710,209 @@ fn draw_geometry_2d(
     match geom {
         Geometry::Point { coordinates } => {
             let (sp, c2) = proj(coordinates);
-            snap_out.push((sp, c2));
-            painter.circle_filled(sp, point_radius, fill);
-            painter.circle_stroke(sp, point_radius, stroke);
-            if let Some(txt) = label {
-                painter.text(
-                    sp + Vec2::new(point_radius + 4.0, -6.0),
-                    egui::Align2::LEFT_CENTER,
-                    txt,
-                    egui::FontId::proportional(11.0),
-                    Color32::WHITE,
+            if !rect.expand(40.0).contains(sp) {
+                return;
+            }
+            if let Some(ref mut snaps) = snap_out {
+                snaps.push((sp, c2));
+            }
+            if is_dxf_text {
+                if let Some(txt) = label {
+                    painter.text(
+                        sp,
+                        egui::Align2::LEFT_CENTER,
+                        txt,
+                        egui::FontId::proportional(11.0),
+                        stroke.color,
+                    );
+                    *labels_drawn += 1;
+                }
+            } else {
+                painter.circle_filled(sp, point_radius, fill);
+                painter.circle_stroke(sp, point_radius, stroke);
+                if let Some(txt) = label {
+                    painter.text(
+                        sp + Vec2::new(point_radius + 4.0, -6.0),
+                        egui::Align2::LEFT_CENTER,
+                        txt,
+                        egui::FontId::proportional(11.0),
+                        Color32::WHITE,
+                    );
+                    *labels_drawn += 1;
+                }
+            }
+        }
+        Geometry::LineString { coordinates } => {
+            if let Some(ref mut snaps) = snap_out {
+                for c in coordinates {
+                    let (sp, c2) = proj(c);
+                    if rect.expand(20.0).contains(sp) {
+                        snaps.push((sp, c2));
+                    }
+                }
+            }
+        }
+        Geometry::Polygon { coordinates } => {
+            if let Some(ext) = coordinates.first() {
+                if let Some(ref mut snaps) = snap_out {
+                    for c in ext {
+                        let (sp, c2) = proj(c);
+                        if rect.expand(20.0).contains(sp) {
+                            snaps.push((sp, c2));
+                        }
+                    }
+                }
+                if let Some(txt) = label {
+                    if ext.len() >= 3 {
+                        let n = ext.len();
+                        let (mut sx, mut sy) = (0.0f32, 0.0f32);
+                        for c in ext {
+                            let (sp, _) = proj(c);
+                            sx += sp.x;
+                            sy += sp.y;
+                        }
+                        let center = Pos2::new(sx / n as f32, sy / n as f32);
+                        if rect.contains(center) {
+                            painter.text(
+                                center,
+                                egui::Align2::CENTER_CENTER,
+                                txt,
+                                egui::FontId::proportional(11.0),
+                                Color32::from_rgb(255, 245, 195),
+                            );
+                            *labels_drawn += 1;
+                        }
+                    }
+                }
+            }
+        }
+        Geometry::MultiPoint { coordinates } => {
+            for c in coordinates {
+                draw_points_and_labels_2d(
+                    painter,
+                    rect,
+                    &Geometry::Point { coordinates: *c },
+                    src_crs,
+                    dst_crs,
+                    world_to_screen,
+                    stroke,
+                    fill,
+                    point_radius,
+                    None,
+                    is_dxf_text,
+                    snap_out.as_deref_mut(),
+                    labels_drawn,
                 );
+            }
+        }
+        Geometry::MultiLineString { coordinates } => {
+            if let Some(ref mut snaps) = snap_out {
+                for l in coordinates {
+                    for c in l {
+                        let (sp, c2) = proj(c);
+                        if rect.expand(20.0).contains(sp) {
+                            snaps.push((sp, c2));
+                        }
+                    }
+                }
+            }
+        }
+        Geometry::MultiPolygon { coordinates } => {
+            for (idx, p) in coordinates.iter().enumerate() {
+                draw_points_and_labels_2d(
+                    painter,
+                    rect,
+                    &Geometry::Polygon {
+                        coordinates: p.clone(),
+                    },
+                    src_crs,
+                    dst_crs,
+                    world_to_screen,
+                    stroke,
+                    fill,
+                    point_radius,
+                    if idx == 0 { label } else { None },
+                    false,
+                    snap_out.as_deref_mut(),
+                    labels_drawn,
+                );
+            }
+        }
+        Geometry::GeometryCollection { geometries } => {
+            for g in geometries {
+                draw_points_and_labels_2d(
+                    painter,
+                    rect,
+                    g,
+                    src_crs,
+                    dst_crs,
+                    world_to_screen,
+                    stroke,
+                    fill,
+                    point_radius,
+                    None,
+                    is_dxf_text,
+                    snap_out.as_deref_mut(),
+                    labels_drawn,
+                );
+            }
+        }
+    }
+}
+
+#[allow(clippy::too_many_arguments)]
+fn draw_geometry_2d(
+    painter: &egui::Painter,
+    geom: &Geometry,
+    src_crs: FrenchCrs,
+    dst_crs: FrenchCrs,
+    world_to_screen: &impl Fn(f64, f64) -> Pos2,
+    stroke: Stroke,
+    fill: Color32,
+    point_radius: f32,
+    label: Option<&str>,
+    mut snap_out: Option<&mut Vec<(Pos2, Coordinate)>>,
+    is_dxf_text: bool,
+) {
+    let proj = |c: &Coordinate| -> (Pos2, Coordinate) {
+        let (x, y) = if src_crs != dst_crs {
+            reproject_point_3d(src_crs, dst_crs, c.x, c.y, c.z.unwrap_or(0.0))
+                .map(|(rx, ry, _)| (rx, ry))
+                .unwrap_or((c.x, c.y))
+        } else {
+            (c.x, c.y)
+        };
+        (world_to_screen(x, y), Coordinate { x, y, z: c.z })
+    };
+
+    match geom {
+        Geometry::Point { coordinates } => {
+            let (sp, c2) = proj(coordinates);
+            if let Some(ref mut snaps) = snap_out {
+                snaps.push((sp, c2));
+            }
+            if is_dxf_text {
+                if let Some(txt) = label {
+                    painter.text(
+                        sp,
+                        egui::Align2::LEFT_CENTER,
+                        txt,
+                        egui::FontId::proportional(11.0),
+                        stroke.color,
+                    );
+                }
+            } else {
+                painter.circle_filled(sp, point_radius, fill);
+                painter.circle_stroke(sp, point_radius, stroke);
+                if let Some(txt) = label {
+                    painter.text(
+                        sp + Vec2::new(point_radius + 4.0, -6.0),
+                        egui::Align2::LEFT_CENTER,
+                        txt,
+                        egui::FontId::proportional(11.0),
+                        Color32::WHITE,
+                    );
+                }
             }
         }
         Geometry::LineString { coordinates } => {
@@ -619,7 +920,9 @@ fn draw_geometry_2d(
                 .iter()
                 .map(|c| {
                     let (sp, c2) = proj(c);
-                    snap_out.push((sp, c2));
+                    if let Some(ref mut snaps) = snap_out {
+                        snaps.push((sp, c2));
+                    }
                     sp
                 })
                 .collect();
@@ -633,12 +936,32 @@ fn draw_geometry_2d(
                     .iter()
                     .map(|c| {
                         let (sp, c2) = proj(c);
-                        snap_out.push((sp, c2));
+                        if let Some(ref mut snaps) = snap_out {
+                            snaps.push((sp, c2));
+                        }
                         sp
                     })
                     .collect();
                 if pts.len() >= 3 {
-                    painter.add(egui::Shape::convex_polygon(pts.clone(), fill, stroke));
+                    // Triangulation ear-clipping même en mode repli CPU pour les bâtiments concaves (L / U)
+                    if fill.a() > 0 {
+                        let ring_f32: Vec<(f32, f32)> = pts.iter().map(|p| (p.x, p.y)).collect();
+                        let mut tris = Vec::new();
+                        sdnc_gpu::triangulate_polygon_earclip(&ring_f32, 0, &mut tris);
+                        if tris.len() >= 3 {
+                            let mut mesh = egui::Mesh::default();
+                            for (i, v) in tris.iter().enumerate() {
+                                mesh.vertices.push(egui::epaint::Vertex {
+                                    pos: Pos2::new(v.x, v.y),
+                                    uv: Pos2::ZERO,
+                                    color: fill,
+                                });
+                                mesh.indices.push(i as u32);
+                            }
+                            painter.add(mesh);
+                        }
+                    }
+                    painter.add(egui::Shape::closed_line(pts.clone(), stroke));
                     if let Some(txt) = label {
                         let cx = pts.iter().map(|p| p.x).sum::<f32>() / pts.len() as f32;
                         let cy = pts.iter().map(|p| p.y).sum::<f32>() / pts.len() as f32;
@@ -646,8 +969,8 @@ fn draw_geometry_2d(
                             Pos2::new(cx, cy),
                             egui::Align2::CENTER_CENTER,
                             txt,
-                            egui::FontId::proportional(11.5),
-                            Color32::WHITE,
+                            egui::FontId::proportional(11.0),
+                            Color32::from_rgb(255, 245, 195),
                         );
                     }
                 }
@@ -665,7 +988,8 @@ fn draw_geometry_2d(
                     fill,
                     point_radius,
                     None,
-                    snap_out,
+                    snap_out.as_deref_mut(),
+                    is_dxf_text,
                 );
             }
         }
@@ -683,12 +1007,13 @@ fn draw_geometry_2d(
                     fill,
                     point_radius,
                     None,
-                    snap_out,
+                    snap_out.as_deref_mut(),
+                    false,
                 );
             }
         }
         Geometry::MultiPolygon { coordinates } => {
-            for p in coordinates {
+            for (idx, p) in coordinates.iter().enumerate() {
                 draw_geometry_2d(
                     painter,
                     &Geometry::Polygon {
@@ -700,8 +1025,9 @@ fn draw_geometry_2d(
                     stroke,
                     fill,
                     point_radius,
-                    None,
-                    snap_out,
+                    if idx == 0 { label } else { None },
+                    snap_out.as_deref_mut(),
+                    false,
                 );
             }
         }
@@ -717,7 +1043,8 @@ fn draw_geometry_2d(
                     fill,
                     point_radius,
                     None,
-                    snap_out,
+                    snap_out.as_deref_mut(),
+                    is_dxf_text,
                 );
             }
         }

@@ -1,21 +1,23 @@
-//! `sdnc-ui` — Interface graphique multiplateforme (Android, Windows, Linux) pour SDNCQField.
+//! `sdnc-ui` — Interface graphique 2D multiplateforme (Android, Windows, Linux) pour SDNCQField.
 //!
-//! Remplace Qt/QML + QGIS par `egui` + `wgpu` (Vulkan) en réutilisant les modules
-//! cartographiques 2D et 3D adaptés d'`AEROPHOTOGRAM` et le moteur RTK/PPK `sdnc-gnss`.
+//! Remplace Qt/QML + QGIS par `egui` + `wgpu` (Vulkan 2D) pour afficher à haute performance :
+//! - Plans cadastraux **DXF, DXF-PCI et EDIGÉO** (triangulation GPU + segments instanciés)
+//! - Flux **IGN Géoplateforme Raster (WMTS)** et **Vecteurs (WFS 2.0 GeoJSON)**
+//! - Couches terrain **GeoPackage (`.gpkg`)** & pilotage GNSS **RTK / PPK** (`sdnc-gnss`)
 
 pub mod gnss_panel;
 pub mod layers_panel;
 pub mod state;
 pub mod viewport_2d;
-pub mod viewport_3d;
 
-pub use state::{MapTool, SdncFieldApp, ViewMode};
+pub use state::{MapTool, SdncFieldApp};
 
 use egui::{Color32, RichText};
 use sdnc_data::FieldWidgetType;
+use std::sync::atomic::Ordering;
 
 impl SdncFieldApp {
-    /// Point d'entrée de rendu unique partagé entre Desktop (`eframe`) et Android (`winit + egui-wgpu`).
+    /// Point d'entrée de rendu unique partagé entre Desktop (`eframe`) et Android (`eframe / wgpu`).
     pub fn render_ui(&mut self, ctx: &egui::Context) {
         let screen_w = ctx.input(|i| i.viewport_rect().width());
         let is_phone = screen_w < 780.0;
@@ -39,24 +41,31 @@ impl SdncFieldApp {
             ctx.set_style(style);
         }
 
+        // Intégrer les couches IGN WFS éventuellement reçues en arrière-plan
+        self.poll_wfs_inbox();
+
         let gnss_tel = self.gnss.snapshot();
         self.tick_gnss_averaging(&gnss_tel);
-        if self.gnss.is_running() || gnss_tel.ppk_running || self.averaging.is_some() {
+        if self.gnss.is_running()
+            || gnss_tel.ppk_running
+            || self.averaging.is_some()
+            || self.wfs_loading.load(Ordering::SeqCst)
+        {
             ctx.request_repaint_after(std::time::Duration::from_millis(120));
         }
 
-        // 1. Barre d'outils supérieure (adaptée téléphone, tablette & desktop)
+        // 1. Barre d'outils supérieure (adaptée téléphone, tablette & PC)
         egui::TopBottomPanel::top("sdnc_top_toolbar").show(ctx, |ui| {
             ui.horizontal_wrapped(|ui| {
                 ui.label(
-                    RichText::new(if is_phone { "SDNC" } else { "SDNCQField-RS" })
+                    RichText::new(if is_phone { "SDNC 2D" } else { "SDNCQField-RS 2D" })
                         .strong()
                         .size(15.0)
                         .color(Color32::from_rgb(80, 220, 255)),
                 );
                 ui.separator();
 
-                if ui.toggle_value(&mut self.show_layers_panel, "📚 Couches").clicked()
+                if ui.toggle_value(&mut self.show_layers_panel, "📚 Carto & Cadastre").clicked()
                     && is_phone
                     && self.show_layers_panel
                 {
@@ -67,13 +76,6 @@ impl SdncFieldApp {
                     && self.show_gnss_panel
                 {
                     self.show_layers_panel = false;
-                }
-                ui.separator();
-
-                ui.selectable_value(&mut self.view_mode, ViewMode::Map2D, "🗺 2D");
-                ui.selectable_value(&mut self.view_mode, ViewMode::Surface3D, "🏔 3D");
-                if !is_phone {
-                    ui.selectable_value(&mut self.view_mode, ViewMode::Split2D3D, "◫ 2D+3D");
                 }
                 ui.separator();
 
@@ -131,11 +133,11 @@ impl SdncFieldApp {
             });
         });
 
-        // 3. Panneau gauche : Projet & Couches (largeur adaptée mobile/tablette/PC)
+        // 3. Panneau gauche : Carto 2D, Cadastre DXF/EDIGÉO & Flux IGN
         let panel_w = if is_phone {
             (screen_w * 0.86).clamp(240.0, 340.0)
         } else {
-            280.0
+            295.0
         };
         if self.show_layers_panel {
             egui::SidePanel::left("sdnc_layers_panel")
@@ -156,16 +158,9 @@ impl SdncFieldApp {
                 });
         }
 
-        // 5. Zone centrale : Cartographie 2D / 3D Vulkan Compute
-        egui::CentralPanel::default().show(ctx, |ui| match self.view_mode {
-            ViewMode::Map2D => viewport_2d::render_viewport_2d(ui, self, &gnss_tel),
-            ViewMode::Surface3D => viewport_3d::render_viewport_3d(ui, self, &gnss_tel),
-            ViewMode::Split2D3D => {
-                ui.columns(2, |cols| {
-                    viewport_2d::render_viewport_2d(&mut cols[0], self, &gnss_tel);
-                    viewport_3d::render_viewport_3d(&mut cols[1], self, &gnss_tel);
-                });
-            }
+        // 5. Zone centrale : Cartographie 2D Haute Performance (Vulkan GPU)
+        egui::CentralPanel::default().show(ctx, |ui| {
+            viewport_2d::render_viewport_2d(ui, self, &gnss_tel);
         });
 
         // 6. Fenêtre modale de formulaire attributaire terrain
@@ -217,7 +212,11 @@ impl SdncFieldApp {
                     ui.separator();
                     ui.horizontal(|ui| {
                         if ui
-                            .button(RichText::new("✔ Enregistrer").strong().color(Color32::LIGHT_GREEN))
+                            .button(
+                                RichText::new("✔ Enregistrer")
+                                    .strong()
+                                    .color(Color32::LIGHT_GREEN),
+                            )
                             .clicked()
                         {
                             commit_form = true;
