@@ -368,6 +368,146 @@ pub fn load_xyz_point_cloud<P: AsRef<std::path::Path>>(
     })
 }
 
+/// Couleur standard ASPRS pour la classification LiDAR HD IGN (Sol, Végétation, Bâti, Eau, Ponts).
+fn asprs_class_rgb(class_code: u8, norm_z: f32) -> (u8, u8, u8) {
+    match class_code {
+        2 => (165, 130, 90),  // Sol (Ground)
+        3 => (110, 185, 80),  // Végétation basse
+        4 => (60, 165, 65),   // Végétation moyenne
+        5 => (30, 130, 50),   // Végétation haute
+        6 => (225, 95, 65),   // Bâtiment
+        9 => (50, 145, 235),  // Eau
+        17 => (205, 195, 175), // Pont
+        _ => {
+            let t = norm_z.clamp(0.0, 1.0);
+            (
+                (60.0 + 185.0 * t) as u8,
+                (140.0 + 80.0 * (1.0 - (t - 0.5).abs() * 2.0)) as u8,
+                (220.0 - 150.0 * t) as u8,
+            )
+        }
+    }
+}
+
+/// Lecteur binaire pur Rust **ASPRS LAS 1.2 / 1.3 / 1.4** (formats 0, 1, 2, 3, 6, 7, 8)
+/// conçu pour charger directement les dalles **LiDAR HD IGN** en VRAM (`LidarCloudData`).
+pub fn load_las_point_cloud<P: AsRef<std::path::Path>>(
+    path: P,
+    max_points: usize,
+    generation: u64,
+) -> anyhow::Result<LidarCloudData> {
+    let bytes = std::fs::read(path.as_ref())?;
+    if bytes.len() < 227 || &bytes[0..4] != b"LASF" {
+        anyhow::bail!("En-tête binaire ASPRS LASF invalide");
+    }
+
+    let ver_major = bytes[24];
+    let ver_minor = bytes[25];
+    let offset_to_points = u32::from_le_bytes(bytes[96..100].try_into()?) as usize;
+    let raw_format = bytes[104];
+    if (raw_format & 0x80) != 0 {
+        anyhow::bail!("Fichier compressé LAZ détecté : décompressez-le en .las non compressé");
+    }
+    let fmt = raw_format & 0x3F;
+    let rec_len = u16::from_le_bytes(bytes[105..107].try_into()?) as usize;
+    if rec_len < 20 {
+        anyhow::bail!("Longueur d'enregistrement LAS invalide: {}", rec_len);
+    }
+
+    let legacy_count = u32::from_le_bytes(bytes[107..111].try_into()?) as u64;
+    let total_points = if ver_major == 1 && ver_minor >= 4 && bytes.len() >= 255 {
+        let ext = u64::from_le_bytes(bytes[247..255].try_into()?);
+        if ext > 0 { ext } else { legacy_count }
+    } else {
+        legacy_count
+    } as usize;
+
+    let read_f64 = |off: usize| -> anyhow::Result<f64> {
+        Ok(f64::from_le_bytes(bytes[off..off + 8].try_into()?))
+    };
+    let scale_x = read_f64(131)?;
+    let scale_y = read_f64(139)?;
+    let scale_z = read_f64(147)?;
+    let off_x = read_f64(155)?;
+    let off_y = read_f64(163)?;
+    let off_z = read_f64(171)?;
+    let max_x = read_f64(179)?;
+    let min_x = read_f64(187)?;
+    let max_y = read_f64(195)?;
+    let min_y = read_f64(203)?;
+    let max_z = read_f64(211)?;
+    let min_z = read_f64(219)?;
+
+    let ox = (min_x + max_x) * 0.5;
+    let oy = (min_y + max_y) * 0.5;
+    let oz = (min_z + max_z) * 0.5;
+    let z_span = (max_z - min_z).max(1.0);
+
+    let avail_records = bytes.len().saturating_sub(offset_to_points) / rec_len;
+    let count = total_points.min(avail_records);
+    let stride = if max_points > 0 && count > max_points {
+        count / max_points
+    } else {
+        1
+    }
+    .max(1);
+
+    let rgb_offset: Option<usize> = match fmt {
+        2 => Some(20),
+        3 => Some(28),
+        7 | 8 => Some(30),
+        _ => None,
+    };
+    let class_offset: usize = if fmt >= 6 { 16 } else { 15 };
+
+    let mut points = Vec::with_capacity(count / stride + 1);
+    for i in (0..count).step_by(stride) {
+        let base = offset_to_points + i * rec_len;
+        let ix = i32::from_le_bytes(bytes[base..base + 4].try_into()?);
+        let iy = i32::from_le_bytes(bytes[base + 4..base + 8].try_into()?);
+        let iz = i32::from_le_bytes(bytes[base + 8..base + 12].try_into()?);
+
+        let wx = ix as f64 * scale_x + off_x;
+        let wy = iy as f64 * scale_y + off_y;
+        let wz = iz as f64 * scale_z + off_z;
+
+        let mut rgb_opt = None;
+        if let Some(roff) = rgb_offset {
+            if roff + 6 <= rec_len {
+                let r16 = u16::from_le_bytes(bytes[base + roff..base + roff + 2].try_into()?);
+                let g16 = u16::from_le_bytes(bytes[base + roff + 2..base + roff + 4].try_into()?);
+                let b16 = u16::from_le_bytes(bytes[base + roff + 4..base + roff + 6].try_into()?);
+                if (r16 | g16 | b16) != 0 {
+                    let r8 = if r16 > 255 { (r16 >> 8) as u8 } else { r16 as u8 };
+                    let g8 = if g16 > 255 { (g16 >> 8) as u8 } else { g16 as u8 };
+                    let b8 = if b16 > 255 { (b16 >> 8) as u8 } else { b16 as u8 };
+                    rgb_opt = Some((r8, g8, b8));
+                }
+            }
+        }
+
+        let (r, g, b) = rgb_opt.unwrap_or_else(|| {
+            let raw_cls = bytes.get(base + class_offset).copied().unwrap_or(0);
+            let cls = if fmt >= 6 { raw_cls } else { raw_cls & 0x1F };
+            let norm_z = ((wz - min_z) / z_span) as f32;
+            asprs_class_rgb(cls, norm_z)
+        });
+
+        points.push(LidarPointGpu {
+            rx: (wx - ox) as f32,
+            ry: (wy - oy) as f32,
+            rz: (wz - oz) as f32,
+            rgba: LidarPointGpu::pack_rgba(r, g, b, 245),
+        });
+    }
+
+    Ok(LidarCloudData {
+        origin_xyz: [ox, oy, oz],
+        points: Arc::new(points),
+        generation,
+    })
+}
+
 #[cfg(test)]
 mod tests {
     use super::*;
@@ -379,5 +519,62 @@ mod tests {
         let cloud = generate_synthetic_lidar_cloud(894500.0, 6269500.0, 245.0, 400.0, 250_000, 1);
         assert_eq!(cloud.points.len(), 250_000);
         assert_eq!(cloud.generation, 1);
+    }
+
+    #[test]
+    fn test_las_12_binary_reader_roundtrip() {
+        let tmp = std::env::temp_dir().join("sdnc_test_lidar_hd.las");
+        // Construit un fichier binaire LAS 1.2 Format 2 (XYZ + Classification + RGB16)
+        let mut buf = vec![0u8; 227];
+        buf[0..4].copy_from_slice(b"LASF");
+        buf[24] = 1; // Major 1
+        buf[25] = 2; // Minor 2
+        buf[94..96].copy_from_slice(&227u16.to_le_bytes()); // Header size
+        buf[96..100].copy_from_slice(&227u32.to_le_bytes()); // Offset to point data
+        buf[104] = 2; // Point Data Format 2 (26 bytes with RGB)
+        buf[105..107].copy_from_slice(&26u16.to_le_bytes());
+        buf[107..111].copy_from_slice(&2u32.to_le_bytes()); // 2 points
+
+        // Scale = 0.001 m, Offset = Lambert-93 Aix/Meyreuil
+        buf[131..139].copy_from_slice(&0.001f64.to_le_bytes());
+        buf[139..147].copy_from_slice(&0.001f64.to_le_bytes());
+        buf[147..155].copy_from_slice(&0.001f64.to_le_bytes());
+        buf[155..163].copy_from_slice(&894_500.0f64.to_le_bytes());
+        buf[163..171].copy_from_slice(&6_269_500.0f64.to_le_bytes());
+        buf[171..179].copy_from_slice(&240.0f64.to_le_bytes());
+
+        // Bounds Max/Min
+        buf[179..187].copy_from_slice(&894_510.0f64.to_le_bytes());
+        buf[187..195].copy_from_slice(&894_500.0f64.to_le_bytes());
+        buf[195..203].copy_from_slice(&6_269_520.0f64.to_le_bytes());
+        buf[203..211].copy_from_slice(&6_269_500.0f64.to_le_bytes());
+        buf[211..219].copy_from_slice(&250.0f64.to_le_bytes());
+        buf[219..227].copy_from_slice(&240.0f64.to_le_bytes());
+
+        // Point 1: +0m, +0m, +0m, class=6 (Building), RGB=(0,0,0 -> uses class color)
+        let mut p1 = vec![0u8; 26];
+        p1[15] = 6;
+        buf.extend_from_slice(&p1);
+
+        // Point 2: +10m, +20m, +10m, RGB16=(255<<8, 128<<8, 64<<8)
+        let mut p2 = vec![0u8; 26];
+        p2[0..4].copy_from_slice(&10_000i32.to_le_bytes());
+        p2[4..8].copy_from_slice(&20_000i32.to_le_bytes());
+        p2[8..12].copy_from_slice(&10_000i32.to_le_bytes());
+        p2[20..22].copy_from_slice(&(255u16 << 8).to_le_bytes());
+        p2[22..24].copy_from_slice(&(128u16 << 8).to_le_bytes());
+        p2[24..26].copy_from_slice(&(64u16 << 8).to_le_bytes());
+        buf.extend_from_slice(&p2);
+
+        std::fs::write(&tmp, &buf).unwrap();
+        let cloud = load_las_point_cloud(&tmp, 1_000_000, 7).unwrap();
+        assert_eq!(cloud.points.len(), 2);
+        assert_eq!(cloud.generation, 7);
+        assert!((cloud.origin_xyz[0] - 894_505.0).abs() < 1e-6);
+        assert!((cloud.points[0].rx - (-5.0)).abs() < 1e-3);
+        assert!((cloud.points[1].rx - 5.0).abs() < 1e-3);
+        assert_eq!(cloud.points[1].rgba & 0xFF, 255);
+        assert_eq!((cloud.points[1].rgba >> 8) & 0xFF, 128);
+        let _ = std::fs::remove_file(&tmp);
     }
 }

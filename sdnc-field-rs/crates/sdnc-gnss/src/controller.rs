@@ -48,6 +48,7 @@ pub struct GnssLiveTelemetry {
 struct ExternalBytePipeline {
     ubx: UbxStreamDecoder,
     rtcm: Rtcm3StreamDecoder,
+    rtk: RtkEngine,
     nmea_buf: String,
     rinex_writer: Option<Rinex3ObsWriter>,
 }
@@ -57,6 +58,7 @@ impl Default for ExternalBytePipeline {
         Self {
             ubx: UbxStreamDecoder::default(),
             rtcm: Rtcm3StreamDecoder::default(),
+            rtk: RtkEngine::new(GnssConfig::default()),
             nmea_buf: String::new(),
             rinex_writer: None,
         }
@@ -79,13 +81,17 @@ impl Default for GnssController {
 
 impl GnssController {
     pub fn new(config: GnssConfig) -> Self {
+        let pipe = ExternalBytePipeline {
+            rtk: RtkEngine::new(config.clone()),
+            ..Default::default()
+        };
         Self {
             config: Arc::new(Mutex::new(config)),
             telemetry: Arc::new(Mutex::new(GnssLiveTelemetry {
                 status_message: "Déconnecté — prêt à démarrer RTK/PPK".to_string(),
                 ..Default::default()
             })),
-            external_pipe: Arc::new(Mutex::new(ExternalBytePipeline::default())),
+            external_pipe: Arc::new(Mutex::new(pipe)),
             stop_flag: Arc::new(AtomicBool::new(true)),
             ppk_record_flag: Arc::new(AtomicBool::new(false)),
         }
@@ -104,7 +110,9 @@ impl GnssController {
 
     /// Injecte un flux brut d'octets provenant d'un récepteur externe u-blox / Emlid Reach
     /// (Bluetooth SPP/BLE Android via JNI, USB-OTG Série, ou port série desktop).
-    /// Décode simultanément UBX (`NAV-PVT`, `RXM-RAWX`), NMEA (`GGA`, `GST`) et enregistre en RINEX 3.04 si PPK actif.
+    /// Décode simultanément UBX (`NAV-PVT`, `RXM-RAWX`), NMEA (`GGA`, `GST`), exécute
+    /// le moteur logiciel `RtkEngine` si les corrections RTCM3 MSM4/7 + éphémérides 1019/1046
+    /// sont présentes, et enregistre en RINEX 3.04 si PPK actif.
     pub fn inject_external_raw_bytes(&self, bytes: &[u8], source_label: &str) {
         if bytes.is_empty() {
             return;
@@ -116,6 +124,7 @@ impl GnssController {
             .external_pipe
             .lock()
             .unwrap_or_else(|e| e.into_inner());
+        pipe.rtk.config = cfg.clone();
         let mut tel = self.telemetry.lock().unwrap_or_else(|e| e.into_inner());
         tel.connected = true;
         tel.raw_bytes_rx += bytes.len() as u64;
@@ -170,6 +179,23 @@ impl GnssController {
                         }
                     } else {
                         pipe.rinex_writer = None;
+                    }
+
+                    // Fusion logicielle RTKLIB-Rust en direct si RTCM3 MSM + éphémérides 1019/1046 disponibles
+                    if !pipe.rtcm.nav_data.ephemerides.is_empty() {
+                        let base_ep = pipe.rtcm.latest_base_epoch.clone();
+                        let base_xyz = cfg.base_ecef_override.or(pipe.rtcm.last_base_ecef);
+                        let nav_snapshot = pipe.rtcm.nav_data.clone();
+                        let rtk_sol = pipe.rtk.process_rtk_epoch(
+                            &epoch,
+                            base_ep.as_ref(),
+                            base_xyz,
+                            &nav_snapshot,
+                        );
+                        if rtk_sol.quality != FixQuality::NoFix {
+                            tel.solution = rtk_sol;
+                            updated_pos = true;
+                        }
                     }
                 }
             }

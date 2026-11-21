@@ -191,12 +191,12 @@ pub fn render_layers_panel(ui: &mut egui::Ui, app: &mut SdncFieldApp) {
                     }
                 });
                 #[cfg(not(target_os = "android"))]
-                if ui.button("📂 Importer Nuage .XYZ").clicked() {
+                if ui.button("📂 Importer LiDAR (.LAS / .XYZ)").clicked() {
                     if let Some(p) = rfd::FileDialog::new()
-                        .add_filter("Nuage LiDAR ASCII", &["xyz", "txt", "csv"])
+                        .add_filter("Nuage LiDAR (LAS / XYZ)", &["las", "xyz", "txt", "csv"])
                         .pick_file()
                     {
-                        app.import_lidar_xyz_file(&p);
+                        app.import_lidar_file(&p);
                     }
                 }
             });

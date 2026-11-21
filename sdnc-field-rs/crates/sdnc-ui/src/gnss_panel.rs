@@ -108,6 +108,48 @@ pub fn render_gnss_panel(ui: &mut egui::Ui, app: &mut SdncFieldApp, tel: &GnssLi
             }
         });
 
+        // 2.b Moyennage multi-époques haute précision (levé sur canne)
+        egui::Frame::group(ui.style()).show(ui, |ui| {
+            ui.horizontal(|ui| {
+                ui.label("Moyennage :");
+                ui.add(egui::DragValue::new(&mut app.avg_target_epochs).range(3..=60));
+                ui.label("ép.");
+                ui.checkbox(&mut app.avg_require_fix, "FIX seul");
+            });
+            if let Some(sess) = &app.averaging {
+                let frac = (sess.samples.len() as f32 / sess.target_epochs.max(1) as f32).clamp(0.0, 1.0);
+                ui.add(
+                    egui::ProgressBar::new(frac)
+                        .text(format!("{}/{} époques", sess.samples.len(), sess.target_epochs)),
+                );
+                if let Some((_, [sx, sy, sz])) = sess.mean_and_std() {
+                    ui.label(
+                        RichText::new(format!(
+                            "Dispersion : σH={:.1} mm | σV={:.1} mm",
+                            (sx * sx + sy * sy).sqrt() * 1000.0,
+                            sz * 1000.0
+                        ))
+                        .size(10.5)
+                        .color(Color32::LIGHT_GREEN),
+                    );
+                }
+                if ui.button("Annuler moyennage").clicked() {
+                    app.averaging = None;
+                }
+            } else if ui
+                .add_enabled(
+                    q != FixQuality::NoFix,
+                    egui::Button::new("🎯 Démarrer Moyennage RTK"),
+                )
+                .clicked()
+            {
+                app.averaging = Some(crate::state::GnssAveragingSession::start(
+                    app.avg_target_epochs,
+                    app.avg_require_fix,
+                ));
+            }
+        });
+
         ui.add_space(6.0);
 
         // 3. Skyplot Polaire & Barres C/N0 (SNR)
@@ -379,9 +421,14 @@ pub fn render_gnss_panel(ui: &mut egui::Ui, app: &mut SdncFieldApp, tel: &GnssLi
                         "Float: {} | Single: {} | σH: {:.2} cm | σV: {:.2} cm",
                         rep.float_epochs, rep.single_epochs, rep.mean_std_h_cm, rep.mean_std_v_cm
                     ));
-                    if ui.button("💾 Importer trajectoire PPK dans la carte (.gpkg)").clicked() {
-                        app.import_ppk_report_as_layer(tel);
-                    }
+                    ui.horizontal(|ui| {
+                        if ui.button("💾 Carte (.gpkg)").clicked() {
+                            app.import_ppk_report_as_layer(tel);
+                        }
+                        if ui.button("📄 Exporter CSV").clicked() {
+                            app.export_ppk_report_csv(tel);
+                        }
+                    });
                 }
             });
     });

@@ -59,6 +59,42 @@ pub struct PendingAttributeForm {
     pub gnss_summary: String,
 }
 
+/// Session de moyennage multi-époques GNSS RTK haute précision (levé topographique sur canne).
+#[derive(Debug, Clone)]
+pub struct GnssAveragingSession {
+    pub target_epochs: usize,
+    pub require_fix_only: bool,
+    pub samples: Vec<(f64, f64, f64)>, // (X_proj, Y_proj, Z_ortho_sol)
+    pub last_epoch_unix: f64,
+}
+
+impl GnssAveragingSession {
+    pub fn start(target_epochs: usize, require_fix_only: bool) -> Self {
+        Self {
+            target_epochs: target_epochs.max(2),
+            require_fix_only,
+            samples: Vec::with_capacity(target_epochs),
+            last_epoch_unix: -1.0,
+        }
+    }
+
+    pub fn mean_and_std(&self) -> Option<([f64; 3], [f64; 3])> {
+        let n = self.samples.len();
+        if n == 0 {
+            return None;
+        }
+        let nf = n as f64;
+        let mx = self.samples.iter().map(|s| s.0).sum::<f64>() / nf;
+        let my = self.samples.iter().map(|s| s.1).sum::<f64>() / nf;
+        let mz = self.samples.iter().map(|s| s.2).sum::<f64>() / nf;
+
+        let vx = self.samples.iter().map(|s| (s.0 - mx).powi(2)).sum::<f64>() / nf;
+        let vy = self.samples.iter().map(|s| (s.1 - my).powi(2)).sum::<f64>() / nf;
+        let vz = self.samples.iter().map(|s| (s.2 - mz).powi(2)).sum::<f64>() / nf;
+        Some(([mx, my, mz], [vx.sqrt(), vy.sqrt(), vz.sqrt()]))
+    }
+}
+
 pub struct SdncFieldApp {
     pub project: SdncProject,
     pub project_dir: PathBuf,
@@ -84,6 +120,9 @@ pub struct SdncFieldApp {
     pub vp3d: Viewport3dState,
 
     pub gnss: GnssController,
+    pub averaging: Option<GnssAveragingSession>,
+    pub avg_target_epochs: usize,
+    pub avg_require_fix: bool,
     pub ppk_rover_path: String,
     pub ppk_base_path: String,
     pub ppk_nav_path: String,
@@ -140,6 +179,9 @@ impl SdncFieldApp {
             vp2d: Viewport2dState::default(),
             vp3d: Viewport3dState::default(),
             gnss: GnssController::default(),
+            averaging: None,
+            avg_target_epochs: 10,
+            avg_require_fix: true,
             ppk_rover_path: base_dir
                 .join("gnss_logs/rover_raw.obs")
                 .to_string_lossy()
@@ -176,18 +218,138 @@ impl SdncFieldApp {
         );
     }
 
-    pub fn import_lidar_xyz_file(&mut self, path: &Path) {
+    pub fn import_lidar_file(&mut self, path: &Path) {
         let next_gen = self.lidar_cloud.generation + 1;
-        match sdnc_gpu::load_xyz_point_cloud(path, next_gen) {
+        let ext = path
+            .extension()
+            .and_then(|s| s.to_str())
+            .unwrap_or("")
+            .to_lowercase();
+        let res = if ext == "las" {
+            sdnc_gpu::load_las_point_cloud(path, 4_000_000, next_gen)
+        } else {
+            sdnc_gpu::load_xyz_point_cloud(path, next_gen)
+        };
+        match res {
             Ok(cloud) => {
                 let n = cloud.points.len();
                 self.lidar_cloud = cloud;
                 self.view_mode = ViewMode::Surface3D;
-                self.status_banner = format!("Nuage LiDAR XYZ importé ({} points GPU)", n);
+                self.status_banner = format!(
+                    "Nuage LiDAR .{} importé ({} points VRAM GPU)",
+                    ext.to_uppercase(),
+                    n
+                );
             }
             Err(e) => {
-                self.status_banner = format!("Erreur import nuage XYZ : {}", e);
+                self.status_banner = format!("Erreur import nuage LiDAR : {}", e);
             }
+        }
+    }
+
+    /// Met à jour une session de moyennage RTK active à chaque nouvelle époque GNSS.
+    pub fn tick_gnss_averaging(&mut self, tel: &GnssLiveTelemetry) {
+        let Some(sess) = &mut self.averaging else {
+            return;
+        };
+        let q = tel.solution.quality;
+        if q == FixQuality::NoFix {
+            return;
+        }
+        if sess.require_fix_only && !matches!(q, FixQuality::RtkFix | FixQuality::PpkFix) {
+            return;
+        }
+        let t_unix = tel.solution.time.to_unix_f64();
+        if (t_unix - sess.last_epoch_unix).abs() < 1e-3 {
+            return;
+        }
+        if let Ok((wx, wy)) = from_wgs84(
+            self.project.active_crs,
+            tel.solution.lon_deg,
+            tel.solution.lat_deg,
+        ) {
+            let ant_h = self
+                .gnss
+                .config
+                .lock()
+                .map(|c| c.antenna_height_m)
+                .unwrap_or(0.0);
+            let z = tel.solution.alt_orthometric_m - ant_h;
+            sess.samples.push((wx, wy, z));
+            sess.last_epoch_unix = t_unix;
+        }
+
+        if sess.samples.len() >= sess.target_epochs {
+            let done = self.averaging.take().unwrap();
+            if let Some(([mx, my, mz], [sx, sy, sz])) = done.mean_and_std() {
+                let geom = Geometry::Point {
+                    coordinates: Coordinate::new_3d(mx, my, mz),
+                };
+                self.open_attribute_form(geom, tel);
+                if let Some(form) = &mut self.pending_form {
+                    let sh_mm = (sx * sx + sy * sy).sqrt() * 1000.0;
+                    let sv_mm = sz * 1000.0;
+                    let summary = format!(
+                        "Moyennage {} ép. ({}) | σH={:.1} mm σV={:.1} mm",
+                        done.samples.len(),
+                        q.label(),
+                        sh_mm,
+                        sv_mm
+                    );
+                    form.gnss_summary = summary.clone();
+                    form.values.insert("gnss_statut".to_string(), summary);
+                }
+                self.status_banner = format!(
+                    "Moyennage GNSS terminé ({} époques) — prêt à enregistrer",
+                    done.samples.len()
+                );
+            }
+        }
+    }
+
+    /// Exporte le dernier rapport PPK en CSV topographique (EPSG actif + WGS84 + qualité + σ).
+    pub fn export_ppk_report_csv(&mut self, tel: &GnssLiveTelemetry) {
+        let Some(report) = &tel.last_ppk_report else {
+            return;
+        };
+        let out_path = self.project_dir.join("ppk_export.csv");
+        if let Some(parent) = out_path.parent() {
+            let _ = std::fs::create_dir_all(parent);
+        }
+        let crs = self.project.active_crs;
+        let mut csv = String::from(
+            "epoch_idx,gps_unix_s,quality,epsg,x_m,y_m,z_ngf_m,lat_deg,lon_deg,h_ellip_m,std_e_m,std_n_m,std_u_m,lambda_ratio,num_sats\n",
+        );
+        for (i, s) in report.solutions.iter().enumerate() {
+            let (wx, wy) = from_wgs84(crs, s.lon_deg, s.lat_deg).unwrap_or((0.0, 0.0));
+            csv.push_str(&format!(
+                "{},{:.3},{},{},{:.4},{:.4},{:.4},{:.8},{:.8},{:.4},{:.4},{:.4},{:.4},{:.2},{}\n",
+                i + 1,
+                s.time.to_unix_f64(),
+                s.quality.label(),
+                crs.epsg(),
+                wx,
+                wy,
+                s.alt_orthometric_m,
+                s.lat_deg,
+                s.lon_deg,
+                s.alt_ellipsoid_m,
+                s.std_enu_m[0],
+                s.std_enu_m[1],
+                s.std_enu_m[2],
+                s.lambda_ratio,
+                s.num_sats
+            ));
+        }
+        match std::fs::write(&out_path, csv) {
+            Ok(()) => {
+                self.status_banner = format!(
+                    "Rapport PPK exporté en CSV ({} époques -> {:?})",
+                    report.total_epochs,
+                    out_path.file_name().unwrap_or_default()
+                );
+            }
+            Err(e) => self.status_banner = format!("Erreur export CSV PPK : {}", e),
         }
     }
 

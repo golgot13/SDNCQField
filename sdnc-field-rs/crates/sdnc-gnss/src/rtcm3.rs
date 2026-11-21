@@ -11,15 +11,26 @@
 //!   - Reconstitution d'un [`ObsEpoch`] prêt à alimenter directement [`crate::RtkEngine`] !
 
 use crate::types::{
-    Constellation, GTime, ObsEpoch, ObsRecord, SatId, CLIGHT, LAMBDA1, LAMBDA2, LAMBDA5,
+    BroadcastEphemeris, Constellation, GTime, NavData, ObsEpoch, ObsRecord, SatId, CLIGHT, LAMBDA1,
+    LAMBDA2, LAMBDA5,
 };
 use std::collections::HashMap;
+use std::f64::consts::PI;
 
 const RANGE_MS: f64 = CLIGHT * 0.001; // ~299792.458 m / ms
+const P2_5: f64 = 1.0 / 32.0;
 const P2_10: f64 = 1.0 / 1024.0;
+const P2_19: f64 = 1.0 / 524_288.0;
 const P2_24: f64 = 1.0 / 16_777_216.0;
 const P2_29: f64 = 1.0 / 536_870_912.0;
 const P2_31: f64 = 1.0 / 2_147_483_648.0;
+const P2_32: f64 = 1.0 / 4_294_967_296.0;
+const P2_33: f64 = 1.0 / 8_589_934_592.0;
+const P2_34: f64 = 1.0 / 17_179_869_184.0;
+const P2_43: f64 = 1.0 / 8_796_093_022_208.0;
+const P2_46: f64 = 1.0 / 70_368_744_177_664.0;
+const P2_55: f64 = 1.0 / 36_028_797_018_963_968.0;
+const P2_59: f64 = 1.0 / 576_460_752_303_423_488.0;
 
 #[derive(Debug, Clone)]
 pub struct MsmDecodedData {
@@ -41,6 +52,8 @@ pub enum Rtcm3Message {
         ecef: [f64; 3],
         antenna_height_m: f64,
     },
+    /// Message 1019 (GPS) ou 1046 (Galileo I/NAV) : Éphéméride radiodiffusée Kepler
+    Ephemeris(BroadcastEphemeris),
     /// Message MSM4 / MSM7 complètement décodé bit-à-bit en observations brutes (code, phase, Doppler, SNR, LLI)
     MsmObservations(MsmDecodedData),
     Other {
@@ -148,15 +161,19 @@ fn msm_signal_band_and_wavelength(constellation: Constellation, sig_id: u8) -> O
     }
 }
 
-/// Décodeur incrémental de flux binaire RTCM 3.3 avec assemblage d'époques multi-constellations.
+/// Décodeur incrémental de flux binaire RTCM 3.3 avec assemblage d'époques multi-constellations
+/// et collecte automatique des éphémérides radiodiffusées (`1019` GPS, `1046` Galileo).
 #[derive(Default)]
 pub struct Rtcm3StreamDecoder {
     buf: Vec<u8>,
     pub valid_frames: u64,
     pub crc_errors: u64,
     pub msm_frames_decoded: u64,
+    pub eph_frames_decoded: u64,
     pub last_base_ecef: Option<[f64; 3]>,
     pub last_station_id: Option<u16>,
+    /// Éphémérides accumulées depuis les trames RTCM 1019/1046 pour alimenter `RtkEngine`
+    pub nav_data: NavData,
     /// Accumulateur courant des observations multi-messages (jusqu'à `sync_flag == false`)
     pending_epoch_records: Vec<ObsRecord>,
     /// Dernière époque complète assemblée prête pour le moteur RTK
@@ -201,6 +218,10 @@ impl Rtcm3StreamDecoder {
                         } => {
                             self.last_station_id = Some(*station_id);
                             self.last_base_ecef = Some(*ecef);
+                        }
+                        Rtcm3Message::Ephemeris(eph) => {
+                            self.eph_frames_decoded += 1;
+                            self.nav_data.add_ephemeris(eph.clone());
                         }
                         Rtcm3Message::MsmObservations(msm) => {
                             self.msm_frames_decoded += 1;
@@ -266,6 +287,8 @@ fn parse_rtcm3_payload(payload: &[u8]) -> Option<Rtcm3Message> {
                 antenna_height_m: ant_h,
             })
         }
+        1019 => decode_rtcm_1019(&mut br).map(Rtcm3Message::Ephemeris),
+        1046 => decode_rtcm_1046(&mut br).map(Rtcm3Message::Ephemeris),
         1074 | 1077 | 1084 | 1087 | 1094 | 1097 | 1114 | 1117 | 1124 | 1127 => {
             let (constellation, is_msm7) = match msg_type {
                 1074 => (Constellation::Gps, false),
@@ -288,6 +311,142 @@ fn parse_rtcm3_payload(payload: &[u8]) -> Option<Rtcm3Message> {
             payload_len: payload.len(),
         }),
     }
+}
+
+/// Décodeur RTCM 3.3 Message 1019 : Éphéméride GPS radiodiffusée (488 bits).
+fn decode_rtcm_1019(br: &mut BitReader<'_>) -> Option<BroadcastEphemeris> {
+    let prn = br.read_u64(6)? as u8;
+    let week_10 = br.read_u64(10)? as i32;
+    let _sv_acc = br.read_u64(4)?;
+    let _code_l2 = br.read_u64(2)?;
+    let idot = br.read_i64(14)? as f64 * P2_43 * PI;
+    let iode = br.read_u64(8)? as i32;
+    let toc_s = br.read_u64(16)? as f64 * 16.0;
+    let f2 = br.read_i64(8)? as f64 * P2_55;
+    let f1 = br.read_i64(16)? as f64 * P2_43;
+    let f0 = br.read_i64(22)? as f64 * P2_31;
+    let _iodc = br.read_u64(10)?;
+    let crs = br.read_i64(16)? as f64 * P2_5;
+    let deln = br.read_i64(16)? as f64 * P2_43 * PI;
+    let m0 = br.read_i64(32)? as f64 * P2_31 * PI;
+    let cuc = br.read_i64(16)? as f64 * P2_29;
+    let e = br.read_u64(32)? as f64 * P2_33;
+    let cus = br.read_i64(16)? as f64 * P2_29;
+    let sqrt_a = br.read_u64(32)? as f64 * P2_19;
+    let toe_s = br.read_u64(16)? as f64 * 16.0;
+    let cic = br.read_i64(16)? as f64 * P2_29;
+    let omg0 = br.read_i64(32)? as f64 * P2_31 * PI;
+    let cis = br.read_i64(16)? as f64 * P2_29;
+    let i0 = br.read_i64(32)? as f64 * P2_31 * PI;
+    let crc = br.read_i64(16)? as f64 * P2_5;
+    let omg = br.read_i64(32)? as f64 * P2_31 * PI;
+    let omgd = br.read_i64(24)? as f64 * P2_43 * PI;
+    let tgd = br.read_i64(8)? as f64 * P2_31;
+    let sv_health = br.read_u64(6)? as u8;
+    let _l2_p = br.read_u64(1)?;
+    let _fit = br.read_u64(1)?;
+
+    // Résolution du rollover 1024 semaines GPS (cycle courant >= 2048)
+    let week = week_10 + 2048;
+    let toe = GTime::from_gps_week_tow(week, toe_s);
+    let toc = GTime::from_gps_week_tow(week, toc_s);
+
+    Some(BroadcastEphemeris {
+        sat: SatId::new(Constellation::Gps, prn),
+        iode,
+        week,
+        toe_s,
+        toc,
+        toe,
+        sqrt_a,
+        e,
+        i0,
+        omg0,
+        omg,
+        m0,
+        deln,
+        idot,
+        omgd,
+        cuc,
+        cus,
+        crc,
+        crs,
+        cic,
+        cis,
+        f0,
+        f1,
+        f2,
+        tgd,
+        sv_health,
+    })
+}
+
+/// Décodeur RTCM 3.3 Message 1046 : Éphéméride Galileo I/NAV radiodiffusée (504 bits).
+fn decode_rtcm_1046(br: &mut BitReader<'_>) -> Option<BroadcastEphemeris> {
+    let prn = br.read_u64(6)? as u8;
+    let gst_week = br.read_u64(12)? as i32;
+    let iode = br.read_u64(10)? as i32;
+    let _sisa = br.read_u64(8)?;
+    let idot = br.read_i64(14)? as f64 * P2_43 * PI;
+    let toc_s = br.read_u64(14)? as f64 * 60.0;
+    let f2 = br.read_i64(6)? as f64 * P2_59;
+    let f1 = br.read_i64(21)? as f64 * P2_46;
+    let f0 = br.read_i64(31)? as f64 * P2_34;
+    let crs = br.read_i64(16)? as f64 * P2_5;
+    let deln = br.read_i64(16)? as f64 * P2_43 * PI;
+    let m0 = br.read_i64(32)? as f64 * P2_31 * PI;
+    let cuc = br.read_i64(16)? as f64 * P2_29;
+    let e = br.read_u64(32)? as f64 * P2_33;
+    let cus = br.read_i64(16)? as f64 * P2_29;
+    let sqrt_a = br.read_u64(32)? as f64 * P2_19;
+    let toe_s = br.read_u64(14)? as f64 * 60.0;
+    let cic = br.read_i64(16)? as f64 * P2_29;
+    let omg0 = br.read_i64(32)? as f64 * P2_31 * PI;
+    let cis = br.read_i64(16)? as f64 * P2_29;
+    let i0 = br.read_i64(32)? as f64 * P2_31 * PI;
+    let crc = br.read_i64(16)? as f64 * P2_5;
+    let omg = br.read_i64(32)? as f64 * P2_31 * PI;
+    let omgd = br.read_i64(24)? as f64 * P2_43 * PI;
+    let tgd = br.read_i64(10)? as f64 * P2_32;
+    let _bgd_e5b = br.read_i64(10)?;
+    let e5b_hs = br.read_u64(2)? as u8;
+    let _e5b_dvs = br.read_u64(1)?;
+    let e1b_hs = br.read_u64(2)? as u8;
+    let _e1b_dvs = br.read_u64(1)?;
+    let _reserved = br.read_u64(2)?;
+
+    let week = gst_week + 1024;
+    let toe = GTime::from_gps_week_tow(week, toe_s);
+    let toc = GTime::from_gps_week_tow(week, toc_s);
+
+    Some(BroadcastEphemeris {
+        sat: SatId::new(Constellation::Galileo, prn),
+        iode,
+        week,
+        toe_s,
+        toc,
+        toe,
+        sqrt_a,
+        e,
+        i0,
+        omg0,
+        omg,
+        m0,
+        deln,
+        idot,
+        omgd,
+        cuc,
+        cus,
+        crc,
+        crs,
+        cic,
+        cis,
+        f0,
+        f1,
+        f2,
+        tgd,
+        sv_health: e1b_hs | (e5b_hs << 2),
+    })
 }
 
 /// Décodeur complet bit-à-bit RTCM 3.3 MSM4 et MSM7 (équivalent `decode_msm4` / `decode_msm7` RTKLIB).
@@ -666,6 +825,58 @@ mod tests {
             assert!((g12.snr[0] - 39.0).abs() < 0.01);
         } else {
             panic!("MsmObservations attendu");
+        }
+    }
+
+    #[test]
+    fn test_rtcm3_1019_gps_ephemeris_decode() {
+        let mut bw = BitWriter::new();
+        bw.write_u64(1019, 12); // GPS Broadcast Ephemeris
+        bw.write_u64(17, 6); // PRN G17
+        bw.write_u64(252, 10); // Week 2048 + 252 = 2300
+        bw.write_u64(0, 4); // sv_acc
+        bw.write_u64(1, 2); // code_l2
+        bw.write_i64(12, 14); // idot
+        bw.write_u64(45, 8); // iode
+        bw.write_u64(6250, 16); // toc = 100000 s
+        bw.write_i64(0, 8); // f2
+        bw.write_i64(100, 16); // f1
+        bw.write_i64(42000, 22); // f0
+        bw.write_u64(45, 10); // iodc
+        bw.write_i64(-320, 16); // crs
+        bw.write_i64(12000, 16); // deln
+        bw.write_i64(500_000_000, 32); // m0
+        bw.write_i64(100, 16); // cuc
+        bw.write_u64(40_000_000, 32); // e (~0.00465)
+        bw.write_i64(-100, 16); // cus
+        bw.write_u64((5153.6_f64 / P2_19).round() as u64, 32); // sqrt_a (~5153.6)
+        bw.write_u64(6250, 16); // toe = 100000 s
+        bw.write_i64(10, 16); // cic
+        bw.write_i64(300_000_000, 32); // omg0
+        bw.write_i64(-10, 16); // cis
+        bw.write_i64(650_000_000, 32); // i0
+        bw.write_i64(6400, 16); // crc
+        bw.write_i64(-200_000_000, 32); // omg
+        bw.write_i64(-22000, 24); // omgd
+        bw.write_i64(-5, 8); // tgd
+        bw.write_u64(0, 6); // sv_health
+        bw.write_u64(0, 1); // l2_p
+        bw.write_u64(0, 1); // fit
+
+        let frame = wrap_rtcm3_frame(&bw.finish());
+        let mut dec = Rtcm3StreamDecoder::default();
+        let msgs = dec.push_bytes(&frame);
+        assert_eq!(dec.eph_frames_decoded, 1);
+        assert_eq!(msgs.len(), 1);
+        if let Rtcm3Message::Ephemeris(eph) = &msgs[0] {
+            assert_eq!(eph.sat, SatId::new(Constellation::Gps, 17));
+            assert_eq!(eph.week, 2300);
+            assert_eq!(eph.iode, 45);
+            assert!((eph.sqrt_a - 5153.6).abs() < 1e-4);
+            assert!((eph.toe_s - 100_000.0).abs() < 1e-6);
+            assert!(dec.nav_data.select_eph(eph.sat, eph.toe).is_some());
+        } else {
+            panic!("Ephemeris 1019 attendu");
         }
     }
 }

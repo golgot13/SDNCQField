@@ -18,7 +18,8 @@ impl SdncFieldApp {
     /// Point d'entrée de rendu unique partagé entre Desktop (`eframe`) et Android (`winit + egui-wgpu`).
     pub fn render_ui(&mut self, ctx: &egui::Context) {
         let gnss_tel = self.gnss.snapshot();
-        if self.gnss.is_running() || gnss_tel.ppk_running {
+        self.tick_gnss_averaging(&gnss_tel);
+        if self.gnss.is_running() || gnss_tel.ppk_running || self.averaging.is_some() {
             ctx.request_repaint_after(std::time::Duration::from_millis(120));
         }
 

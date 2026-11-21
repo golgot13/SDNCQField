@@ -12,7 +12,7 @@ pub mod terrain;
 
 pub use context::{GpuBackendInfo, VulkanComputeContext};
 pub use lidar_renderer::{
-    generate_synthetic_lidar_cloud, load_xyz_point_cloud, LidarCameraUniform, LidarCloudData,
-    LidarGpuPipeline, LidarPointGpu, LidarWgpuCallback,
+    generate_synthetic_lidar_cloud, load_las_point_cloud, load_xyz_point_cloud, LidarCameraUniform,
+    LidarCloudData, LidarGpuPipeline, LidarPointGpu, LidarWgpuCallback,
 };
 pub use terrain::{TerrainCellOutput, TerrainGridResult, TerrainSampleGpu, VulkanTerrainEngine};

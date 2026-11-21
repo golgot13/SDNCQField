@@ -1,0 +1,81 @@
+name: SDNCQField-RS (Linux / Windows / Android)
+
+on:
+  push:
+    branches: [master, main, "feat/**"]
+    paths:
+      - "sdnc-field-rs/**"
+      - ".github/workflows/sdnc-field-rs.yml"
+  pull_request:
+    paths:
+      - "sdnc-field-rs/**"
+      - ".github/workflows/sdnc-field-rs.yml"
+  workflow_dispatch:
+
+jobs:
+  desktop-linux:
+    name: Linux x86_64 (Build & Tests)
+    runs-on: ubuntu-latest
+    defaults:
+      run:
+        working-directory: sdnc-field-rs
+    steps:
+      - uses: actions/checkout@v4
+      - name: Install Linux GUI system dependencies
+        run: |
+          sudo apt-get update
+          sudo apt-get install -y libxcb-render0-dev libxcb-shape0-dev libxcb-xfixes0-dev libxkbcommon-dev libssl-dev libgtk-3-dev
+      - uses: dtolnay/rust-toolchain@stable
+      - uses: Swatinem/rust-cache@v2
+        with:
+          workspaces: sdnc-field-rs -> target
+      - name: Run unit tests
+        run: cargo test --workspace
+      - name: Build release binary (Linux Vulkan)
+        run: cargo build --release -p sdnc-app-desktop
+      - uses: actions/upload-artifact@v4
+        with:
+          name: sdnc-field-linux-x86_64
+          path: sdnc-field-rs/target/release/sdnc-field
+
+  desktop-windows:
+    name: Windows x86_64 (Build & Tests)
+    runs-on: windows-latest
+    defaults:
+      run:
+        working-directory: sdnc-field-rs
+    steps:
+      - uses: actions/checkout@v4
+      - uses: dtolnay/rust-toolchain@stable
+      - uses: Swatinem/rust-cache@v2
+        with:
+          workspaces: sdnc-field-rs -> target
+      - name: Run unit tests
+        run: cargo test --workspace
+      - name: Build release binary (Windows Vulkan/DX12)
+        run: cargo build --release -p sdnc-app-desktop
+      - uses: actions/upload-artifact@v4
+        with:
+          name: sdnc-field-windows-x86_64
+          path: sdnc-field-rs/target/release/sdnc-field.exe
+
+  android-arm64:
+    name: Android arm64-v8a (cargo-ndk Vulkan 1.1+)
+    runs-on: ubuntu-latest
+    defaults:
+      run:
+        working-directory: sdnc-field-rs
+    steps:
+      - uses: actions/checkout@v4
+      - uses: dtolnay/rust-toolchain@stable
+        with:
+          targets: aarch64-linux-android
+      - name: Install cargo-ndk
+        run: cargo install cargo-ndk --locked
+      - name: Build Android arm64-v8a native library (.so)
+        run: |
+          cargo ndk -t arm64-v8a -o android/app/src/main/jniLibs build --release -p sdnc-app-android
+      - uses: actions/upload-artifact@v4
+        with:
+          name: sdnc-field-android-arm64-so
+          path: sdnc-field-rs/android/app/src/main/jniLibs/arm64-v8a/libsdnc_field_android.so
