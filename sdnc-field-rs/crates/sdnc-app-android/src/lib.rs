@@ -132,9 +132,13 @@ pub extern "system" fn Java_fr_sdnc_qfield_MainActivity_nativeOnRtcmBytes(
 #[cfg(test)]
 mod tests {
     use super::*;
+    use std::sync::Mutex;
+
+    static BRIDGE_TEST_LOCK: Mutex<()> = Mutex::new(());
 
     #[test]
     fn test_android_gnss_bridge_injection() {
+        let _guard = BRIDGE_TEST_LOCK.lock().unwrap_or_else(|e| e.into_inner());
         push_android_location_sample(43.5297, 5.4474, 252.0, 1.8, 14);
         let snap = shared_gnss_bridge().snapshot();
         assert!(snap.connected);
@@ -144,6 +148,7 @@ mod tests {
 
     #[test]
     fn test_android_external_bluetooth_bytes_bridge() {
+        let _guard = BRIDGE_TEST_LOCK.lock().unwrap_or_else(|e| e.into_inner());
         let gga = sdnc_gnss::nmea::format_gga_sentence(43.5501, 5.4902, 260.0);
         push_android_external_gnss_bytes(gga.as_bytes(), "Bluetooth Emlid Reach");
         let snap = shared_gnss_bridge().snapshot();
