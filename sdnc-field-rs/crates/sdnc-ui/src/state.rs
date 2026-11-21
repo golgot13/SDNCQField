@@ -119,7 +119,7 @@ pub struct SdncFieldApp {
     pub vp2d: Viewport2dState,
     pub vp3d: Viewport3dState,
 
-    pub gnss: GnssController,
+    pub gnss: std::sync::Arc<GnssController>,
     pub averaging: Option<GnssAveragingSession>,
     pub avg_target_epochs: usize,
     pub avg_require_fix: bool,
@@ -133,6 +133,7 @@ pub struct SdncFieldApp {
     pub identified_info: Option<String>,
     pub search_query: String,
     pub status_banner: String,
+    pub mobile_layout_initialized: bool,
 }
 
 impl SdncFieldApp {
@@ -143,6 +144,18 @@ impl SdncFieldApp {
     pub fn new_with_wgpu(
         base_dir: PathBuf,
         wgpu_target_format: Option<egui_wgpu::wgpu::TextureFormat>,
+    ) -> Self {
+        Self::new_with_wgpu_and_gnss(
+            base_dir,
+            wgpu_target_format,
+            std::sync::Arc::new(GnssController::default()),
+        )
+    }
+
+    pub fn new_with_wgpu_and_gnss(
+        base_dir: PathBuf,
+        wgpu_target_format: Option<egui_wgpu::wgpu::TextureFormat>,
+        gnss: std::sync::Arc<GnssController>,
     ) -> Self {
         let project = SdncProject::default();
         let project_file = base_dir.join("projet_terrain.sdnc.json");
@@ -178,7 +191,7 @@ impl SdncFieldApp {
             wgpu_target_format,
             vp2d: Viewport2dState::default(),
             vp3d: Viewport3dState::default(),
-            gnss: GnssController::default(),
+            gnss,
             averaging: None,
             avg_target_epochs: 10,
             avg_require_fix: true,
@@ -200,6 +213,7 @@ impl SdncFieldApp {
             identified_info: None,
             search_query: String::new(),
             status_banner: format!("SDNCQField Rust prêt | Compute : {}", gpu_label),
+            mobile_layout_initialized: false,
         };
 
         app.init_default_layers();

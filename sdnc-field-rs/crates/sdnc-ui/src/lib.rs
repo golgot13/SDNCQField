@@ -17,30 +17,64 @@ use sdnc_data::FieldWidgetType;
 impl SdncFieldApp {
     /// Point d'entrée de rendu unique partagé entre Desktop (`eframe`) et Android (`winit + egui-wgpu`).
     pub fn render_ui(&mut self, ctx: &egui::Context) {
+        let screen_w = ctx.input(|i| i.viewport_rect().width());
+        let is_phone = screen_w < 780.0;
+        let is_tablet = (780.0..1150.0).contains(&screen_w);
+
+        // Sur téléphone portable, démarre en plein écran carte et agrandit les zones tactiles
+        if !self.mobile_layout_initialized && screen_w > 0.0 {
+            if is_phone {
+                self.show_layers_panel = false;
+                self.show_gnss_panel = false;
+            } else if is_tablet {
+                self.show_layers_panel = false;
+                self.show_gnss_panel = true;
+            }
+            self.mobile_layout_initialized = true;
+        }
+        if is_phone || is_tablet {
+            let mut style = (*ctx.style()).clone();
+            style.spacing.interact_size = egui::vec2(42.0, 34.0);
+            style.spacing.button_padding = egui::vec2(10.0, 6.0);
+            ctx.set_style(style);
+        }
+
         let gnss_tel = self.gnss.snapshot();
         self.tick_gnss_averaging(&gnss_tel);
         if self.gnss.is_running() || gnss_tel.ppk_running || self.averaging.is_some() {
             ctx.request_repaint_after(std::time::Duration::from_millis(120));
         }
 
-        // 1. Barre d'outils supérieure (adaptée tactile & desktop)
+        // 1. Barre d'outils supérieure (adaptée téléphone, tablette & desktop)
         egui::TopBottomPanel::top("sdnc_top_toolbar").show(ctx, |ui| {
             ui.horizontal_wrapped(|ui| {
                 ui.label(
-                    RichText::new("SDNCQField-RS")
+                    RichText::new(if is_phone { "SDNC" } else { "SDNCQField-RS" })
                         .strong()
                         .size(15.0)
                         .color(Color32::from_rgb(80, 220, 255)),
                 );
                 ui.separator();
 
-                ui.toggle_value(&mut self.show_layers_panel, "📚 Couches");
-                ui.toggle_value(&mut self.show_gnss_panel, "🛰 GNSS RTK/PPK");
+                if ui.toggle_value(&mut self.show_layers_panel, "📚 Couches").clicked()
+                    && is_phone
+                    && self.show_layers_panel
+                {
+                    self.show_gnss_panel = false;
+                }
+                if ui.toggle_value(&mut self.show_gnss_panel, "🛰 GNSS").clicked()
+                    && is_phone
+                    && self.show_gnss_panel
+                {
+                    self.show_layers_panel = false;
+                }
                 ui.separator();
 
                 ui.selectable_value(&mut self.view_mode, ViewMode::Map2D, "🗺 2D");
-                ui.selectable_value(&mut self.view_mode, ViewMode::Surface3D, "🏔 3D Vulkan");
-                ui.selectable_value(&mut self.view_mode, ViewMode::Split2D3D, "◫ 2D+3D");
+                ui.selectable_value(&mut self.view_mode, ViewMode::Surface3D, "🏔 3D");
+                if !is_phone {
+                    ui.selectable_value(&mut self.view_mode, ViewMode::Split2D3D, "◫ 2D+3D");
+                }
                 ui.separator();
 
                 for tool in [
@@ -97,11 +131,16 @@ impl SdncFieldApp {
             });
         });
 
-        // 3. Panneau gauche : Projet & Couches
+        // 3. Panneau gauche : Projet & Couches (largeur adaptée mobile/tablette/PC)
+        let panel_w = if is_phone {
+            (screen_w * 0.86).clamp(240.0, 340.0)
+        } else {
+            280.0
+        };
         if self.show_layers_panel {
             egui::SidePanel::left("sdnc_layers_panel")
-                .default_width(275.0)
-                .resizable(true)
+                .default_width(panel_w)
+                .resizable(!is_phone)
                 .show(ctx, |ui| {
                     layers_panel::render_layers_panel(ui, self);
                 });
@@ -110,8 +149,8 @@ impl SdncFieldApp {
         // 4. Panneau droit : Pilotage GNSS RTK & PPK (RTKLIB-Rust)
         if self.show_gnss_panel {
             egui::SidePanel::right("sdnc_gnss_panel")
-                .default_width(305.0)
-                .resizable(true)
+                .default_width(if is_phone { panel_w } else { 305.0 })
+                .resizable(!is_phone)
                 .show(ctx, |ui| {
                     gnss_panel::render_gnss_panel(ui, self, &gnss_tel);
                 });

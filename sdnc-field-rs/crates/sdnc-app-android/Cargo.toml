@@ -13,7 +13,7 @@ sdnc-gnss = { path = "../sdnc-gnss" }
 
 [target.'cfg(target_os = "android")'.dependencies]
 sdnc-ui = { path = "../sdnc-ui" }
-eframe.workspace = true
+eframe = { workspace = true, features = ["android-game-activity"] }
 egui.workspace = true
 log.workspace = true
 android_logger = "0.14"

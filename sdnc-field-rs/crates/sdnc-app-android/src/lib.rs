@@ -72,7 +72,11 @@ pub fn android_main(app: winit::platform::android::activity::AndroidApp) {
         Box::new(move |cc| {
             cc.egui_ctx.set_visuals(egui::Visuals::dark());
             let target_fmt = cc.wgpu_render_state.as_ref().map(|rs| rs.target_format);
-            Ok(Box::new(SdncFieldApp::new_with_wgpu(data_dir, target_fmt)))
+            Ok(Box::new(SdncFieldApp::new_with_wgpu_and_gnss(
+                data_dir,
+                target_fmt,
+                Arc::clone(shared_gnss_bridge()),
+            )))
         }),
     );
 }
