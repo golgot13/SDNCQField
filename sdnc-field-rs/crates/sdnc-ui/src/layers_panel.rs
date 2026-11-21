@@ -169,5 +169,36 @@ pub fn render_layers_panel(ui: &mut egui::Ui, app: &mut SdncFieldApp) {
         {
             app.vp3d.invalidate_terrain();
         }
+
+        ui.separator();
+        egui::CollapsingHeader::new("Nuage LiDAR GPU (egui_wgpu::Callback)")
+            .default_open(true)
+            .show(ui, |ui| {
+                ui.label(format!(
+                    "Points VRAM actifs : {}",
+                    app.lidar_cloud.points.len()
+                ));
+                ui.add(
+                    egui::Slider::new(&mut app.lidar_point_size_px, 1.0..=8.0)
+                        .text("Taille points (px)"),
+                );
+                ui.horizontal(|ui| {
+                    if ui.button("☁ Démo 250k pts").clicked() {
+                        app.load_demo_lidar_cloud(250_000);
+                    }
+                    if ui.button("☁ Démo 1M pts").clicked() {
+                        app.load_demo_lidar_cloud(1_000_000);
+                    }
+                });
+                #[cfg(not(target_os = "android"))]
+                if ui.button("📂 Importer Nuage .XYZ").clicked() {
+                    if let Some(p) = rfd::FileDialog::new()
+                        .add_filter("Nuage LiDAR ASCII", &["xyz", "txt", "csv"])
+                        .pick_file()
+                    {
+                        app.import_lidar_xyz_file(&p);
+                    }
+                }
+            });
     });
 }

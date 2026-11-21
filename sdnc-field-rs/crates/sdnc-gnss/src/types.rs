@@ -328,6 +328,8 @@ pub enum ReceiverSource {
     SimulatedRtk,
     TcpStream,
     UdpStream,
+    SerialPort,
+    BluetoothExternal,
     AndroidInternal,
 }
 
@@ -363,6 +365,12 @@ pub struct GnssConfig {
     pub tcp_host: String,
     pub tcp_port: u16,
     pub udp_port: u16,
+    /// Port série USB/COM pour u-blox ZED-F9P / Emlid Reach (ex. `/dev/ttyACM0` ou `COM3`)
+    pub serial_port_path: String,
+    pub serial_baud_rate: u32,
+    /// Récepteur Bluetooth externe Android SPP/BLE (ex. `Reach RS2+`, `u-blox ZED-F9P`)
+    pub bluetooth_device_name: String,
+    pub bluetooth_device_mac: String,
     pub elevation_mask_deg: f64,
     pub lambda_ratio_thresh: f64,
     pub code_sigma_m: f64,
@@ -382,6 +390,14 @@ impl Default for GnssConfig {
             tcp_host: "127.0.0.1".to_string(),
             tcp_port: 5000,
             udp_port: 5001,
+            serial_port_path: if cfg!(target_os = "windows") {
+                "COM3".to_string()
+            } else {
+                "/dev/ttyACM0".to_string()
+            },
+            serial_baud_rate: 115_200,
+            bluetooth_device_name: "Emlid Reach / u-blox ZED-F9P".to_string(),
+            bluetooth_device_mac: String::new(),
             elevation_mask_deg: 15.0,
             lambda_ratio_thresh: 3.0,
             code_sigma_m: 0.3,

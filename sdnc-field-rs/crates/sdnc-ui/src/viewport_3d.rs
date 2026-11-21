@@ -368,12 +368,13 @@ pub fn render_viewport_3d(
         Pos2::new(rect.min.x + 12.0, rect.min.y + 14.0),
         egui::Align2::LEFT_TOP,
         format!(
-            "Vue 3D MNT [{}] | Pitch {:.0}° Yaw {:.0}° | Exag Z x{:.1}",
+            "Vue 3D MNT [{}] | LiDAR GPU: {} pts | Pitch {:.0}° Yaw {:.0}° | Exag Z x{:.1}",
             if computed_on_gpu {
                 "Vulkan Compute"
             } else {
                 "CPU Fallback"
             },
+            app.lidar_cloud.points.len(),
             app.vp3d.pitch_deg,
             app.vp3d.yaw_deg,
             app.vp3d.z_exaggeration

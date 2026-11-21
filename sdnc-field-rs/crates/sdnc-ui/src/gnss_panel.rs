@@ -156,6 +156,20 @@ pub fn render_gnss_panel(ui: &mut egui::Ui, app: &mut SdncFieldApp, tel: &GnssLi
                         changed |= ui
                             .selectable_value(
                                 &mut cfg.source,
+                                ReceiverSource::SerialPort,
+                                "Port Série USB (u-blox / Emlid)",
+                            )
+                            .changed();
+                        changed |= ui
+                            .selectable_value(
+                                &mut cfg.source,
+                                ReceiverSource::BluetoothExternal,
+                                "Bluetooth SPP Android (u-blox / Reach)",
+                            )
+                            .changed();
+                        changed |= ui
+                            .selectable_value(
+                                &mut cfg.source,
                                 ReceiverSource::AndroidInternal,
                                 "Android GPS Interne (JNI)",
                             )
@@ -201,6 +215,29 @@ pub fn render_gnss_panel(ui: &mut egui::Ui, app: &mut SdncFieldApp, tel: &GnssLi
                         ui.label("Port UDP:");
                         changed |= ui.add(egui::DragValue::new(&mut cfg.udp_port)).changed();
                     });
+                } else if cfg.source == ReceiverSource::SerialPort {
+                    ui.horizontal(|ui| {
+                        ui.label("Port:");
+                        changed |= ui.text_edit_singleline(&mut cfg.serial_port_path).changed();
+                    });
+                    ui.horizontal(|ui| {
+                        ui.label("Bauds:");
+                        changed |= ui
+                            .add(egui::DragValue::new(&mut cfg.serial_baud_rate).speed(1200))
+                            .changed();
+                    });
+                } else if cfg.source == ReceiverSource::BluetoothExternal {
+                    ui.horizontal(|ui| {
+                        ui.label("Récepteur BT:");
+                        changed |= ui
+                            .text_edit_singleline(&mut cfg.bluetooth_device_name)
+                            .changed();
+                    });
+                    ui.label(
+                        RichText::new(format!("Flux brut reçu : {} octets", tel.raw_bytes_rx))
+                            .size(10.5)
+                            .color(Color32::LIGHT_BLUE),
+                    );
                 }
 
                 changed |= ui
@@ -228,7 +265,7 @@ pub fn render_gnss_panel(ui: &mut egui::Ui, app: &mut SdncFieldApp, tel: &GnssLi
             });
 
         // 5. Client NTRIP v1/v2 (Corrections RTCM3)
-        egui::CollapsingHeader::new("Client NTRIP (Corrections RTCM3)")
+        egui::CollapsingHeader::new("Client NTRIP (Corrections RTCM3 MSM7)")
             .default_open(false)
             .show(ui, |ui| {
                 let mut cfg = app
@@ -266,8 +303,8 @@ pub fn render_gnss_panel(ui: &mut egui::Ui, app: &mut SdncFieldApp, tel: &GnssLi
                     .checkbox(&mut cfg.ntrip.send_gga, "Envoyer GGA (VRS / NEAR)")
                     .changed();
                 ui.label(format!(
-                    "RTCM3 reçues : {} trames | Base ID : {:?}",
-                    tel.rtcm_frames_rx, tel.base_station_id
+                    "RTCM3 : {} trames ({} MSM4/7) | Base ID : {:?}",
+                    tel.rtcm_frames_rx, tel.rtcm_msm_epochs_rx, tel.base_station_id
                 ));
 
                 if changed {

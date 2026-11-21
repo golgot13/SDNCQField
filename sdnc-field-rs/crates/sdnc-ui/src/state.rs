@@ -77,6 +77,9 @@ pub struct SdncFieldApp {
 
     pub tile_client: TileStreamClient,
     pub terrain_engine: VulkanTerrainEngine,
+    pub lidar_cloud: sdnc_gpu::LidarCloudData,
+    pub lidar_point_size_px: f32,
+    pub wgpu_target_format: Option<egui_wgpu::wgpu::TextureFormat>,
     pub vp2d: Viewport2dState,
     pub vp3d: Viewport3dState,
 
@@ -95,6 +98,13 @@ pub struct SdncFieldApp {
 
 impl SdncFieldApp {
     pub fn new(base_dir: PathBuf) -> Self {
+        Self::new_with_wgpu(base_dir, None)
+    }
+
+    pub fn new_with_wgpu(
+        base_dir: PathBuf,
+        wgpu_target_format: Option<egui_wgpu::wgpu::TextureFormat>,
+    ) -> Self {
         let project = SdncProject::default();
         let project_file = base_dir.join("projet_terrain.sdnc.json");
 
@@ -124,6 +134,9 @@ impl SdncFieldApp {
             snapping_radius_px: 14.0,
             tile_client,
             terrain_engine,
+            lidar_cloud: sdnc_gpu::LidarCloudData::default(),
+            lidar_point_size_px: 3.0,
+            wgpu_target_format,
             vp2d: Viewport2dState::default(),
             vp3d: Viewport3dState::default(),
             gnss: GnssController::default(),
@@ -149,6 +162,33 @@ impl SdncFieldApp {
 
         app.init_default_layers();
         app
+    }
+
+    pub fn load_demo_lidar_cloud(&mut self, num_points: usize) {
+        let (cx, cy) = self.project.center_xy.unwrap_or((894500.0, 6269500.0));
+        let next_gen = self.lidar_cloud.generation + 1;
+        self.lidar_cloud =
+            sdnc_gpu::generate_synthetic_lidar_cloud(cx, cy, 245.0, 420.0, num_points, next_gen);
+        self.view_mode = ViewMode::Surface3D;
+        self.status_banner = format!(
+            "Nuage LiDAR GPU chargé ({} points -> rendu natif egui_wgpu::Callback)",
+            num_points
+        );
+    }
+
+    pub fn import_lidar_xyz_file(&mut self, path: &Path) {
+        let next_gen = self.lidar_cloud.generation + 1;
+        match sdnc_gpu::load_xyz_point_cloud(path, next_gen) {
+            Ok(cloud) => {
+                let n = cloud.points.len();
+                self.lidar_cloud = cloud;
+                self.view_mode = ViewMode::Surface3D;
+                self.status_banner = format!("Nuage LiDAR XYZ importé ({} points GPU)", n);
+            }
+            Err(e) => {
+                self.status_banner = format!("Erreur import nuage XYZ : {}", e);
+            }
+        }
     }
 
     fn init_default_layers(&mut self) {

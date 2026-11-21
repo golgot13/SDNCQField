@@ -33,19 +33,40 @@ pub struct GnssLiveTelemetry {
     pub solution: GnssSolution,
     pub ntrip_connected: bool,
     pub rtcm_frames_rx: u64,
+    pub rtcm_msm_epochs_rx: u64,
     pub base_station_id: Option<u16>,
     pub base_ecef: Option<[f64; 3]>,
     pub ppk_recording: bool,
     pub ppk_epochs_logged: usize,
+    pub raw_bytes_rx: u64,
     pub track_history_wgs84: Vec<(f64, f64, f64, FixQuality)>,
     pub event_markers: Vec<(String, GnssSolution)>,
     pub last_ppk_report: Option<PpkReport>,
     pub ppk_running: bool,
 }
 
+struct ExternalBytePipeline {
+    ubx: UbxStreamDecoder,
+    rtcm: Rtcm3StreamDecoder,
+    nmea_buf: String,
+    rinex_writer: Option<Rinex3ObsWriter>,
+}
+
+impl Default for ExternalBytePipeline {
+    fn default() -> Self {
+        Self {
+            ubx: UbxStreamDecoder::default(),
+            rtcm: Rtcm3StreamDecoder::default(),
+            nmea_buf: String::new(),
+            rinex_writer: None,
+        }
+    }
+}
+
 pub struct GnssController {
     pub config: Arc<Mutex<GnssConfig>>,
     pub telemetry: Arc<Mutex<GnssLiveTelemetry>>,
+    external_pipe: Arc<Mutex<ExternalBytePipeline>>,
     stop_flag: Arc<AtomicBool>,
     ppk_record_flag: Arc<AtomicBool>,
 }
@@ -64,6 +85,7 @@ impl GnssController {
                 status_message: "Déconnecté — prêt à démarrer RTK/PPK".to_string(),
                 ..Default::default()
             })),
+            external_pipe: Arc::new(Mutex::new(ExternalBytePipeline::default())),
             stop_flag: Arc::new(AtomicBool::new(true)),
             ppk_record_flag: Arc::new(AtomicBool::new(false)),
         }
@@ -78,6 +100,141 @@ impl GnssController {
             .lock()
             .unwrap_or_else(|e| e.into_inner())
             .clone()
+    }
+
+    /// Injecte un flux brut d'octets provenant d'un récepteur externe u-blox / Emlid Reach
+    /// (Bluetooth SPP/BLE Android via JNI, USB-OTG Série, ou port série desktop).
+    /// Décode simultanément UBX (`NAV-PVT`, `RXM-RAWX`), NMEA (`GGA`, `GST`) et enregistre en RINEX 3.04 si PPK actif.
+    pub fn inject_external_raw_bytes(&self, bytes: &[u8], source_label: &str) {
+        if bytes.is_empty() {
+            return;
+        }
+        let cfg = self.config.lock().unwrap_or_else(|e| e.into_inner()).clone();
+        let ppk_rec = self.ppk_record_flag.load(Ordering::SeqCst);
+
+        let mut pipe = self
+            .external_pipe
+            .lock()
+            .unwrap_or_else(|e| e.into_inner());
+        let mut tel = self.telemetry.lock().unwrap_or_else(|e| e.into_inner());
+        tel.connected = true;
+        tel.raw_bytes_rx += bytes.len() as u64;
+
+        let mut updated_pos = false;
+
+        // 1. Décodage binaire UBX (u-blox ZED-F9P / M8T)
+        for msg in pipe.ubx.push_bytes(bytes) {
+            match msg {
+                UbxMessage::NavPvt {
+                    lat_deg,
+                    lon_deg,
+                    alt_ellipsoid_m,
+                    alt_msl_m,
+                    h_acc_m,
+                    v_acc_m,
+                    num_sv,
+                    quality,
+                } => {
+                    let (ex, ey, ez) = geodetic_to_ecef(
+                        lat_deg.to_radians(),
+                        lon_deg.to_radians(),
+                        alt_ellipsoid_m,
+                        &WGS84,
+                    );
+                    tel.solution.ecef = [ex, ey, ez];
+                    tel.solution.lat_deg = lat_deg;
+                    tel.solution.lon_deg = lon_deg;
+                    tel.solution.alt_ellipsoid_m = alt_ellipsoid_m;
+                    tel.solution.alt_orthometric_m = alt_msl_m;
+                    tel.solution.std_enu_m = [h_acc_m, h_acc_m, v_acc_m];
+                    tel.solution.num_sats = num_sv;
+                    tel.solution.quality = quality;
+                    tel.solution.time = GTime::from_unix_f64(chrono::Utc::now().timestamp() as f64);
+                    updated_pos = true;
+                }
+                UbxMessage::RxmRawx(epoch) => {
+                    // Enregistrement brut RINEX 3.04 pour post-traitement PPK
+                    if ppk_rec {
+                        if pipe.rinex_writer.is_none() {
+                            pipe.rinex_writer = Rinex3ObsWriter::create(
+                                &cfg.raw_ppk_output_path,
+                                tel.solution.ecef,
+                                "EXT_ROVER",
+                            )
+                            .ok();
+                        }
+                        if let Some(w) = pipe.rinex_writer.as_mut() {
+                            let _ = w.write_epoch(&epoch);
+                            let _ = w.flush();
+                            tel.ppk_epochs_logged = w.epochs_written;
+                        }
+                    } else {
+                        pipe.rinex_writer = None;
+                    }
+                }
+            }
+        }
+
+        // 2. Décodage ASCII NMEA-0183 (Emlid Reach / u-blox / GNSS générique)
+        pipe.nmea_buf.push_str(&String::from_utf8_lossy(bytes));
+        if pipe.nmea_buf.len() > 8192 {
+            let drain_to = pipe.nmea_buf.len() - 4096;
+            pipe.nmea_buf.drain(0..drain_to);
+        }
+        while let Some(pos) = pipe.nmea_buf.find('\n') {
+            let line: String = pipe.nmea_buf.drain(..=pos).collect();
+            if parse_nmea_line(&line, &mut tel.solution) {
+                updated_pos = true;
+            }
+        }
+
+        if updated_pos && tel.solution.quality != FixQuality::NoFix {
+            let quality = tel.solution.quality;
+            let num_sats = tel.solution.num_sats;
+            let sh_cm = ((tel.solution.std_enu_m[0].powi(2) + tel.solution.std_enu_m[1].powi(2))
+                .sqrt())
+                * 100.0;
+            let (lon, lat, alt) = (
+                tel.solution.lon_deg,
+                tel.solution.lat_deg,
+                tel.solution.alt_ellipsoid_m,
+            );
+            tel.status_message = format!(
+                "{} — {} | {} sats | σH {:.1} cm",
+                source_label,
+                quality.label(),
+                num_sats,
+                sh_cm
+            );
+            tel.track_history_wgs84.push((lon, lat, alt, quality));
+            if tel.track_history_wgs84.len() > 2000 {
+                tel.track_history_wgs84.remove(0);
+            }
+        }
+    }
+
+    /// Injecte des octets RTCM 3.3 (NTRIP / radio / Bluetooth Base) dans le décodeur MSM4/MSM7.
+    pub fn inject_rtcm_bytes(&self, bytes: &[u8]) {
+        if bytes.is_empty() {
+            return;
+        }
+        let mut pipe = self
+            .external_pipe
+            .lock()
+            .unwrap_or_else(|e| e.into_inner());
+        let msgs = pipe.rtcm.push_bytes(bytes);
+        if !msgs.is_empty() {
+            let mut tel = self.telemetry.lock().unwrap_or_else(|e| e.into_inner());
+            tel.ntrip_connected = true;
+            tel.rtcm_frames_rx = pipe.rtcm.valid_frames;
+            tel.rtcm_msm_epochs_rx = pipe.rtcm.msm_frames_decoded;
+            if let Some(id) = pipe.rtcm.last_station_id {
+                tel.base_station_id = Some(id);
+            }
+            if let Some(ecef) = pipe.rtcm.last_base_ecef {
+                tel.base_ecef = Some(ecef);
+            }
+        }
     }
 
     /// Injecte une position provenant du GPS interne Android (via JNI).
@@ -148,6 +305,16 @@ impl GnssController {
                 }
                 ReceiverSource::UdpStream => {
                     run_udp_stream_loop(cfg, tel_arc, stop);
+                }
+                ReceiverSource::SerialPort => {
+                    run_serial_port_loop(cfg, tel_arc, stop, ppk_rec);
+                }
+                ReceiverSource::BluetoothExternal => {
+                    let mut t = tel_arc.lock().unwrap_or_else(|e| e.into_inner());
+                    t.status_message = format!(
+                        "Bluetooth SPP actif ({}) — en attente flux JNI u-blox/Emlid",
+                        cfg.bluetooth_device_name
+                    );
                 }
                 ReceiverSource::AndroidInternal => {
                     let mut t = tel_arc.lock().unwrap_or_else(|e| e.into_inner());
@@ -546,6 +713,175 @@ fn run_tcp_stream_loop(
                     let mut tel = tel_arc.lock().unwrap_or_else(|e| e.into_inner());
                     tel.ntrip_connected = true;
                     tel.rtcm_frames_rx = rtcm_dec.valid_frames;
+                    tel.rtcm_msm_epochs_rx = rtcm_dec.msm_frames_decoded;
+                }
+            }
+        }
+    }
+}
+
+/// Boucle port série USB/COM (Linux `/dev/ttyACM0`, `/dev/ttyUSB0`, Windows `COM3`)
+/// pour récepteurs externes u-blox ZED-F9P / Emlid Reach avec renvoi bidirectionnel RTCM3 NTRIP
+/// et enregistrement RINEX 3.04 PPK des trames `UBX-RXM-RAWX`.
+fn run_serial_port_loop(
+    cfg: GnssConfig,
+    tel_arc: Arc<Mutex<GnssLiveTelemetry>>,
+    stop: Arc<AtomicBool>,
+    ppk_rec: Arc<AtomicBool>,
+) {
+    // Sur Linux, configure le baudrate via `stty` sans dépendance libudev native
+    #[cfg(target_os = "linux")]
+    {
+        let _ = std::process::Command::new("stty")
+            .args([
+                "-F",
+                &cfg.serial_port_path,
+                &cfg.serial_baud_rate.to_string(),
+                "raw",
+                "-echo",
+                "-echoe",
+                "-echok",
+            ])
+            .status();
+    }
+
+    let mut serial = match std::fs::OpenOptions::new()
+        .read(true)
+        .write(true)
+        .open(&cfg.serial_port_path)
+    {
+        Ok(f) => f,
+        Err(e) => {
+            let mut t = tel_arc.lock().unwrap_or_else(|e| e.into_inner());
+            t.connected = false;
+            t.status_message = format!(
+                "Port série '{}' ({} bauds) inaccessible : {}",
+                cfg.serial_port_path, cfg.serial_baud_rate, e
+            );
+            return;
+        }
+    };
+
+    let mut ntrip_stream = if cfg.ntrip.enabled {
+        connect_ntrip_stream(&cfg.ntrip).ok()
+    } else {
+        None
+    };
+
+    let mut ubx_dec = UbxStreamDecoder::default();
+    let mut rtcm_dec = Rtcm3StreamDecoder::default();
+    let mut nmea_buf = String::new();
+    let mut cur_sol = GnssSolution::default();
+    let mut rinex_writer: Option<Rinex3ObsWriter> = None;
+    let mut last_gga_tx = Instant::now();
+    let mut tmp = [0u8; 2048];
+
+    while !stop.load(Ordering::SeqCst) {
+        if let Ok(n) = serial.read(&mut tmp) {
+            if n > 0 {
+                let slice = &tmp[..n];
+                for msg in ubx_dec.push_bytes(slice) {
+                    match msg {
+                        UbxMessage::NavPvt {
+                            lat_deg,
+                            lon_deg,
+                            alt_ellipsoid_m,
+                            alt_msl_m,
+                            h_acc_m,
+                            v_acc_m,
+                            num_sv,
+                            quality,
+                        } => {
+                            let (ex, ey, ez) = geodetic_to_ecef(
+                                lat_deg.to_radians(),
+                                lon_deg.to_radians(),
+                                alt_ellipsoid_m,
+                                &WGS84,
+                            );
+                            cur_sol.ecef = [ex, ey, ez];
+                            cur_sol.lat_deg = lat_deg;
+                            cur_sol.lon_deg = lon_deg;
+                            cur_sol.alt_ellipsoid_m = alt_ellipsoid_m;
+                            cur_sol.alt_orthometric_m = alt_msl_m;
+                            cur_sol.std_enu_m = [h_acc_m, h_acc_m, v_acc_m];
+                            cur_sol.num_sats = num_sv;
+                            cur_sol.quality = quality;
+                        }
+                        UbxMessage::RxmRawx(epoch) => {
+                            if ppk_rec.load(Ordering::SeqCst) {
+                                if rinex_writer.is_none() {
+                                    rinex_writer = Rinex3ObsWriter::create(
+                                        &cfg.raw_ppk_output_path,
+                                        cur_sol.ecef,
+                                        "SERIAL_UBX",
+                                    )
+                                    .ok();
+                                }
+                                if let Some(w) = rinex_writer.as_mut() {
+                                    let _ = w.write_epoch(&epoch);
+                                    let _ = w.flush();
+                                }
+                            } else {
+                                rinex_writer = None;
+                            }
+                        }
+                    }
+                }
+                nmea_buf.push_str(&String::from_utf8_lossy(slice));
+                while let Some(pos) = nmea_buf.find('\n') {
+                    let line: String = nmea_buf.drain(..=pos).collect();
+                    parse_nmea_line(&line, &mut cur_sol);
+                }
+
+                let mut tel = tel_arc.lock().unwrap_or_else(|e| e.into_inner());
+                tel.raw_bytes_rx += n as u64;
+                tel.ppk_epochs_logged = rinex_writer.as_ref().map(|w| w.epochs_written).unwrap_or(0);
+                tel.solution = cur_sol.clone();
+                tel.status_message = format!(
+                    "Série {} ({} bds) — {}",
+                    cfg.serial_port_path,
+                    cfg.serial_baud_rate,
+                    cur_sol.quality.label()
+                );
+                if cur_sol.quality != FixQuality::NoFix {
+                    tel.track_history_wgs84.push((
+                        cur_sol.lon_deg,
+                        cur_sol.lat_deg,
+                        cur_sol.alt_ellipsoid_m,
+                        cur_sol.quality,
+                    ));
+                }
+            }
+        }
+
+        // Envoi des corrections RTCM3 NTRIP vers le port série du récepteur u-blox/Emlid
+        if let Some(ns) = ntrip_stream.as_mut() {
+            if cfg.ntrip.send_gga
+                && last_gga_tx.elapsed() >= Duration::from_secs(5)
+                && cur_sol.quality != FixQuality::NoFix
+            {
+                let gga = format_gga_sentence(
+                    cur_sol.lat_deg,
+                    cur_sol.lon_deg,
+                    cur_sol.alt_orthometric_m,
+                );
+                let _ = ns.write_all(gga.as_bytes());
+                last_gga_tx = Instant::now();
+            }
+            if let Ok(rn) = ns.read(&mut tmp) {
+                if rn > 0 {
+                    let _ = serial.write_all(&tmp[..rn]);
+                    let _ = rtcm_dec.push_bytes(&tmp[..rn]);
+                    let mut tel = tel_arc.lock().unwrap_or_else(|e| e.into_inner());
+                    tel.ntrip_connected = true;
+                    tel.rtcm_frames_rx = rtcm_dec.valid_frames;
+                    tel.rtcm_msm_epochs_rx = rtcm_dec.msm_frames_decoded;
+                    if let Some(id) = rtcm_dec.last_station_id {
+                        tel.base_station_id = Some(id);
+                    }
+                    if let Some(ecef) = rtcm_dec.last_base_ecef {
+                        tel.base_ecef = Some(ecef);
+                    }
                 }
             }
         }
@@ -588,5 +924,22 @@ fn run_udp_stream_loop(
                 }
             }
         }
+    }
+}
+
+#[cfg(test)]
+mod tests {
+    use super::*;
+
+    #[test]
+    fn test_external_bluetooth_nmea_stream_injection() {
+        let ctrl = GnssController::default();
+        let gga = format_gga_sentence(43.5123, 5.4891, 238.4);
+        ctrl.inject_external_raw_bytes(gga.as_bytes(), "Bluetooth Reach RS2+");
+        let snap = ctrl.snapshot();
+        assert!(snap.connected);
+        assert!(snap.raw_bytes_rx > 0);
+        assert_eq!(snap.solution.quality, FixQuality::Single);
+        assert!((snap.solution.lat_deg - 43.5123).abs() < 1e-4);
     }
 }

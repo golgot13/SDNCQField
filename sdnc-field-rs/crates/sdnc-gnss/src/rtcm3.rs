@@ -1,7 +1,37 @@
-//! Décodeur RTCM 3.x (CRC-24Q + Station ARP 1005/1006 + entêtes MSM4/MSM7).
+//! Décodeur RTCM 3.3 complet bit-à-bit (CRC-24Q + Station ARP 1005/1006 + MSM4 & MSM7).
 //!
-//! Inspiré de `rtcm3.c` de RTKLIB : permet d'extraire la position de la base RTK
-//! et le flux de messages de correction différentielle reçu via NTRIP / radio.
+//! Portage fidèle de `rtcm3.c` de RTKLIB (standard RTCM 10403.3) :
+//! - Vérification CRC-24Q (`0x1864CFB`)
+//! - Messages 1005 / 1006 : Position ARP de la station de base en ECEF (résolution 0.1 mm)
+//! - Messages **MSM4** (`1074`, `1084`, `1094`, `1114`, `1124`) et **MSM7** (`1077`, `1087`, `1097`, `1117`, `1127`) :
+//!   - Décodage complet de l'en-tête 169 bits (masque satellites 64 bits, masque signaux 32 bits, masque cellules)
+//!   - Décodage des données satellites (rough range ms entier + mod 1 ms + extended info + phase range rate)
+//!   - Décodage des données signaux (fine pseudorange 15/20 bits, fine phase range 22/24 bits, lock time 4/10 bits,
+//!     half-cycle ambiguity, CNR 6/10 bits, fine Doppler 15 bits)
+//!   - Reconstitution d'un [`ObsEpoch`] prêt à alimenter directement [`crate::RtkEngine`] !
+
+use crate::types::{
+    Constellation, GTime, ObsEpoch, ObsRecord, SatId, CLIGHT, LAMBDA1, LAMBDA2, LAMBDA5,
+};
+use std::collections::HashMap;
+
+const RANGE_MS: f64 = CLIGHT * 0.001; // ~299792.458 m / ms
+const P2_10: f64 = 1.0 / 1024.0;
+const P2_24: f64 = 1.0 / 16_777_216.0;
+const P2_29: f64 = 1.0 / 536_870_912.0;
+const P2_31: f64 = 1.0 / 2_147_483_648.0;
+
+#[derive(Debug, Clone)]
+pub struct MsmDecodedData {
+    pub msg_type: u16,
+    pub constellation: Constellation,
+    pub is_msm7: bool,
+    pub station_id: u16,
+    pub epoch_ms: u32,
+    pub sync_flag: bool,
+    pub iods: u8,
+    pub records: Vec<ObsRecord>,
+}
 
 #[derive(Debug, Clone)]
 pub enum Rtcm3Message {
@@ -11,13 +41,8 @@ pub enum Rtcm3Message {
         ecef: [f64; 3],
         antenna_height_m: f64,
     },
-    /// Message MSM4/MSM7 (1074/1077 GPS, 1084/1087 GLO, 1094/1097 GAL, 1124/1127 BDS)
-    MsmHeader {
-        msg_type: u16,
-        station_id: u16,
-        epoch_ms: u32,
-        sync_flag: bool,
-    },
+    /// Message MSM4 / MSM7 complètement décodé bit-à-bit en observations brutes (code, phase, Doppler, SNR, LLI)
+    MsmObservations(MsmDecodedData),
     Other {
         msg_type: u16,
         payload_len: usize,
@@ -39,38 +64,103 @@ pub fn crc24q(data: &[u8]) -> u32 {
     crc & 0xFF_FFFF
 }
 
-fn get_bits_u64(buf: &[u8], bit_pos: usize, len: usize) -> u64 {
-    let mut val = 0u64;
-    for i in 0..len {
-        let pos = bit_pos + i;
-        let byte_idx = pos / 8;
-        let bit_idx = 7 - (pos % 8);
-        if byte_idx < buf.len() {
-            val = (val << 1) | (((buf[byte_idx] >> bit_idx) & 1) as u64);
+/// Lecteur de bits MSB-first pour les trames binaires RTCM 3.x.
+struct BitReader<'a> {
+    buf: &'a [u8],
+    bit_pos: usize,
+}
+
+impl<'a> BitReader<'a> {
+    fn new(buf: &'a [u8]) -> Self {
+        Self { buf, bit_pos: 0 }
+    }
+
+    fn remaining_bits(&self) -> usize {
+        (self.buf.len() * 8).saturating_sub(self.bit_pos)
+    }
+
+    fn read_u64(&mut self, len: usize) -> Option<u64> {
+        if len == 0 {
+            return Some(0);
+        }
+        if len > 64 || self.remaining_bits() < len {
+            return None;
+        }
+        let mut val = 0u64;
+        for _ in 0..len {
+            let byte_idx = self.bit_pos / 8;
+            let bit_idx = 7 - (self.bit_pos % 8);
+            val = (val << 1) | (((self.buf[byte_idx] >> bit_idx) & 1) as u64);
+            self.bit_pos += 1;
+        }
+        Some(val)
+    }
+
+    fn read_i64(&mut self, len: usize) -> Option<i64> {
+        let u = self.read_u64(len)?;
+        if len == 0 || len >= 64 {
+            return Some(u as i64);
+        }
+        let sign_bit = 1u64 << (len - 1);
+        if (u & sign_bit) != 0 {
+            Some((u | (!0u64 << len)) as i64)
+        } else {
+            Some(u as i64)
         }
     }
-    val
 }
 
-fn get_bits_i64(buf: &[u8], bit_pos: usize, len: usize) -> i64 {
-    let u = get_bits_u64(buf, bit_pos, len);
-    if len == 0 || len >= 64 {
-        return u as i64;
-    }
-    let sign_bit = 1u64 << (len - 1);
-    if (u & sign_bit) != 0 {
-        (u | (!0u64 << len)) as i64
-    } else {
-        u as i64
+/// Associe un numéro de signal RTCM MSM (1..=32) à `(bande 0=L1/1=L2/2=L5, longueur d'onde m)`.
+fn msm_signal_band_and_wavelength(constellation: Constellation, sig_id: u8) -> Option<(usize, f64)> {
+    match constellation {
+        Constellation::Gps => match sig_id {
+            2..=4 => Some((0, LAMBDA1)),            // L1 C/A, P, W
+            8..=10 | 15..=17 => Some((1, LAMBDA2)), // L2 P, W, C(M/L)
+            22..=24 => Some((2, LAMBDA5)),          // L5 I/Q/I+Q
+            30..=32 => Some((0, LAMBDA1)),          // L1C
+            _ => None,
+        },
+        Constellation::Galileo => match sig_id {
+            2..=6 => Some((0, LAMBDA1)),   // E1 C/A/B/B+C
+            14..=16 => Some((1, LAMBDA2)), // E6 (slot secondaire)
+            18..=20 => Some((1, CLIGHT / 1.207_14e9)), // E5b
+            22..=24 => Some((2, LAMBDA5)), // E5a
+            _ => None,
+        },
+        Constellation::BeiDou => match sig_id {
+            2..=4 => Some((0, CLIGHT / 1.561_098e9)), // B1I
+            30..=32 => Some((0, LAMBDA1)),            // B1C
+            14..=16 => Some((1, CLIGHT / 1.207_14e9)), // B2I / B2b
+            22..=24 => Some((2, LAMBDA5)),            // B2a
+            _ => None,
+        },
+        Constellation::Glonass => match sig_id {
+            2..=3 => Some((0, CLIGHT / 1.602e9)), // G1 nominal
+            8..=9 => Some((1, CLIGHT / 1.246e9)), // G2 nominal
+            _ => None,
+        },
+        Constellation::Qzss => match sig_id {
+            2 | 30..=32 => Some((0, LAMBDA1)),
+            15..=17 => Some((1, LAMBDA2)),
+            22..=24 => Some((2, LAMBDA5)),
+            _ => None,
+        },
     }
 }
 
-/// Décodeur incrémental de flux binaire RTCM 3.x.
+/// Décodeur incrémental de flux binaire RTCM 3.3 avec assemblage d'époques multi-constellations.
 #[derive(Default)]
 pub struct Rtcm3StreamDecoder {
     buf: Vec<u8>,
     pub valid_frames: u64,
     pub crc_errors: u64,
+    pub msm_frames_decoded: u64,
+    pub last_base_ecef: Option<[f64; 3]>,
+    pub last_station_id: Option<u16>,
+    /// Accumulateur courant des observations multi-messages (jusqu'à `sync_flag == false`)
+    pending_epoch_records: Vec<ObsRecord>,
+    /// Dernière époque complète assemblée prête pour le moteur RTK
+    pub latest_base_epoch: Option<ObsEpoch>,
 }
 
 impl Rtcm3StreamDecoder {
@@ -101,11 +191,42 @@ impl Rtcm3StreamDecoder {
 
             if calc_crc == frame_crc {
                 self.valid_frames += 1;
-                let payload = &self.buf[3..3 + payload_len];
-                if let Some(msg) = parse_rtcm3_payload(payload) {
+                let payload = self.buf[3..3 + payload_len].to_vec();
+                self.buf.drain(0..frame_len);
+
+                if let Some(msg) = parse_rtcm3_payload(&payload) {
+                    match &msg {
+                        Rtcm3Message::StationArp {
+                            station_id, ecef, ..
+                        } => {
+                            self.last_station_id = Some(*station_id);
+                            self.last_base_ecef = Some(*ecef);
+                        }
+                        Rtcm3Message::MsmObservations(msm) => {
+                            self.msm_frames_decoded += 1;
+                            self.last_station_id = Some(msm.station_id);
+                            self.pending_epoch_records.extend(msm.records.clone());
+                            // Quand sync_flag == false, c'est le dernier message MSM de l'époque
+                            if !msm.sync_flag {
+                                let (week, _) = GTime::from_unix_f64(
+                                    chrono::Utc::now().timestamp() as f64,
+                                )
+                                .to_gps_week_tow();
+                                let epoch_time = GTime::from_gps_week_tow(
+                                    week,
+                                    (msm.epoch_ms as f64) * 0.001,
+                                );
+                                let records = std::mem::take(&mut self.pending_epoch_records);
+                                self.latest_base_epoch = Some(ObsEpoch {
+                                    time: epoch_time,
+                                    records,
+                                });
+                            }
+                        }
+                        Rtcm3Message::Other { .. } => {}
+                    }
                     out.push(msg);
                 }
-                self.buf.drain(0..frame_len);
             } else {
                 self.crc_errors += 1;
                 self.buf.drain(0..1);
@@ -117,18 +238,21 @@ impl Rtcm3StreamDecoder {
 }
 
 fn parse_rtcm3_payload(payload: &[u8]) -> Option<Rtcm3Message> {
-    if payload.len() < 2 {
-        return None;
-    }
-    let msg_type = get_bits_u64(payload, 0, 12) as u16;
+    let mut br = BitReader::new(payload);
+    let msg_type = br.read_u64(12)? as u16;
+
     match msg_type {
-        1005 | 1006 if payload.len() >= 19 => {
-            let station_id = get_bits_u64(payload, 12, 12) as u16;
-            let x_raw = get_bits_i64(payload, 34, 38);
-            let y_raw = get_bits_i64(payload, 74, 38);
-            let z_raw = get_bits_i64(payload, 114, 38);
-            let ant_h = if msg_type == 1006 && payload.len() >= 21 {
-                get_bits_u64(payload, 152, 16) as f64 * 0.0001
+        1005 | 1006 => {
+            let station_id = br.read_u64(12)? as u16;
+            let _itrf_year = br.read_u64(6)?;
+            let _flags = br.read_u64(4)?;
+            let x_raw = br.read_i64(38)?;
+            let _osc = br.read_u64(2)?;
+            let y_raw = br.read_i64(38)?;
+            let _qc = br.read_u64(2)?;
+            let z_raw = br.read_i64(38)?;
+            let ant_h = if msg_type == 1006 {
+                br.read_u64(16)? as f64 * 0.0001
             } else {
                 0.0
             };
@@ -142,16 +266,22 @@ fn parse_rtcm3_payload(payload: &[u8]) -> Option<Rtcm3Message> {
                 antenna_height_m: ant_h,
             })
         }
-        1074 | 1077 | 1084 | 1087 | 1094 | 1097 | 1124 | 1127 if payload.len() >= 8 => {
-            let station_id = get_bits_u64(payload, 12, 12) as u16;
-            let epoch_ms = get_bits_u64(payload, 24, 30) as u32;
-            let sync_flag = get_bits_u64(payload, 54, 1) == 1;
-            Some(Rtcm3Message::MsmHeader {
-                msg_type,
-                station_id,
-                epoch_ms,
-                sync_flag,
-            })
+        1074 | 1077 | 1084 | 1087 | 1094 | 1097 | 1114 | 1117 | 1124 | 1127 => {
+            let (constellation, is_msm7) = match msg_type {
+                1074 => (Constellation::Gps, false),
+                1077 => (Constellation::Gps, true),
+                1084 => (Constellation::Glonass, false),
+                1087 => (Constellation::Glonass, true),
+                1094 => (Constellation::Galileo, false),
+                1097 => (Constellation::Galileo, true),
+                1114 => (Constellation::Qzss, false),
+                1117 => (Constellation::Qzss, true),
+                1124 => (Constellation::BeiDou, false),
+                1127 => (Constellation::BeiDou, true),
+                _ => return None,
+            };
+            decode_msm_body(&mut br, msg_type, constellation, is_msm7)
+                .map(Rtcm3Message::MsmObservations)
         }
         _ => Some(Rtcm3Message::Other {
             msg_type,
@@ -160,28 +290,382 @@ fn parse_rtcm3_payload(payload: &[u8]) -> Option<Rtcm3Message> {
     }
 }
 
+/// Décodeur complet bit-à-bit RTCM 3.3 MSM4 et MSM7 (équivalent `decode_msm4` / `decode_msm7` RTKLIB).
+fn decode_msm_body(
+    br: &mut BitReader<'_>,
+    msg_type: u16,
+    constellation: Constellation,
+    is_msm7: bool,
+) -> Option<MsmDecodedData> {
+    // ── 1. En-tête MSM (169 bits au total incluant msg_type) ──────────────────
+    let station_id = br.read_u64(12)? as u16;
+    let epoch_ms = br.read_u64(30)? as u32;
+    let sync_flag = br.read_u64(1)? == 1;
+    let iods = br.read_u64(3)? as u8;
+    let _reserved = br.read_u64(7)?;
+    let _clk_steer = br.read_u64(2)?;
+    let _ext_clk = br.read_u64(2)?;
+    let _smooth = br.read_u64(1)?;
+    let _smooth_int = br.read_u64(3)?;
+
+    let sat_mask = br.read_u64(64)?;
+    let sig_mask = br.read_u64(32)? as u32;
+
+    let mut sat_prns = Vec::new();
+    for i in 0..64u8 {
+        if ((sat_mask >> (63 - i)) & 1) != 0 {
+            sat_prns.push(i + 1);
+        }
+    }
+    let mut sig_ids = Vec::new();
+    for j in 0..32u8 {
+        if ((sig_mask >> (31 - j)) & 1) != 0 {
+            sig_ids.push(j + 1);
+        }
+    }
+
+    let nsat = sat_prns.len();
+    let nsig = sig_ids.len();
+    if nsat == 0 || nsig == 0 || nsat * nsig > 64 {
+        return Some(MsmDecodedData {
+            msg_type,
+            constellation,
+            is_msm7,
+            station_id,
+            epoch_ms,
+            sync_flag,
+            iods,
+            records: Vec::new(),
+        });
+    }
+
+    // Masque cellules (nsat * nsig bits)
+    let mut cells: Vec<(usize, usize)> = Vec::new();
+    for s_idx in 0..nsat {
+        for sig_idx in 0..nsig {
+            if br.read_u64(1)? == 1 {
+                cells.push((s_idx, sig_idx));
+            }
+        }
+    }
+    let ncell = cells.len();
+
+    // ── 2. Données Satellites ─────────────────────────────────────────────────
+    let mut rough_ms = Vec::with_capacity(nsat);
+    for _ in 0..nsat {
+        rough_ms.push(br.read_u64(8)? as u8);
+    }
+    let mut _ext_sat_info = Vec::with_capacity(nsat);
+    if is_msm7 {
+        for _ in 0..nsat {
+            _ext_sat_info.push(br.read_u64(4)? as u8);
+        }
+    }
+    let mut rough_mod = Vec::with_capacity(nsat);
+    for _ in 0..nsat {
+        rough_mod.push(br.read_u64(10)? as u16);
+    }
+    let mut rough_prr = vec![0.0f64; nsat];
+    if is_msm7 {
+        for val in &mut rough_prr {
+            let raw = br.read_i64(14)?;
+            *val = if raw == -8192 { 0.0 } else { raw as f64 };
+        }
+    }
+
+    // ── 3. Données Signaux (ncell entrées) ────────────────────────────────────
+    let mut fine_pr_m = vec![f64::NAN; ncell];
+    let mut fine_cp_m = vec![f64::NAN; ncell];
+    let mut lock_ind = vec![0u16; ncell];
+    let mut half_cyc = vec![false; ncell];
+    let mut cnr_dbhz = vec![0.0f32; ncell];
+    let mut fine_prr_ms = vec![0.0f64; ncell];
+
+    if is_msm7 {
+        for v in &mut fine_pr_m {
+            let raw = br.read_i64(20)?;
+            if raw != -524_288 {
+                *v = (raw as f64) * P2_29 * RANGE_MS;
+            }
+        }
+        for v in &mut fine_cp_m {
+            let raw = br.read_i64(24)?;
+            if raw != -8_388_608 {
+                *v = (raw as f64) * P2_31 * RANGE_MS;
+            }
+        }
+        for l in &mut lock_ind {
+            *l = br.read_u64(10)? as u16;
+        }
+        for h in &mut half_cyc {
+            *h = br.read_u64(1)? == 1;
+        }
+        for c in &mut cnr_dbhz {
+            *c = (br.read_u64(10)? as f32) * 0.0625; // 2^-4 dB-Hz
+        }
+        for d in &mut fine_prr_ms {
+            let raw = br.read_i64(15)?;
+            if raw != -16_384 {
+                *d = (raw as f64) * 0.0001; // m/s
+            }
+        }
+    } else {
+        // MSM4
+        for v in &mut fine_pr_m {
+            let raw = br.read_i64(15)?;
+            if raw != -16_384 {
+                *v = (raw as f64) * P2_24 * RANGE_MS;
+            }
+        }
+        for v in &mut fine_cp_m {
+            let raw = br.read_i64(22)?;
+            if raw != -2_097_152 {
+                *v = (raw as f64) * P2_29 * RANGE_MS;
+            }
+        }
+        for l in &mut lock_ind {
+            *l = br.read_u64(4)? as u16;
+        }
+        for h in &mut half_cyc {
+            *h = br.read_u64(1)? == 1;
+        }
+        for c in &mut cnr_dbhz {
+            *c = br.read_u64(6)? as f32; // 1.0 dB-Hz
+        }
+    }
+
+    // ── 4. Reconstruction des ObsRecord par satellite ─────────────────────────
+    let mut by_sat: HashMap<SatId, ObsRecord> = HashMap::new();
+    for (cell_i, &(s_idx, sig_idx)) in cells.iter().enumerate() {
+        let rms_int = rough_ms[s_idx];
+        if rms_int == 255 {
+            continue; // Rough range invalide
+        }
+        let sat = SatId::new(constellation, sat_prns[s_idx]);
+        let sig_id = sig_ids[sig_idx];
+        let Some((band, wavelength)) = msm_signal_band_and_wavelength(constellation, sig_id) else {
+            continue;
+        };
+
+        let rough_range_m = ((rms_int as f64) + (rough_mod[s_idx] as f64) * P2_10) * RANGE_MS;
+        let rec = by_sat.entry(sat).or_insert_with(|| ObsRecord::new(sat));
+
+        if fine_pr_m[cell_i].is_finite() {
+            rec.pseudorange[band] = rough_range_m + fine_pr_m[cell_i];
+        }
+        if fine_cp_m[cell_i].is_finite() {
+            rec.carrier_phase[band] = (rough_range_m + fine_cp_m[cell_i]) / wavelength;
+        }
+        if is_msm7 {
+            let total_prr = rough_prr[s_idx] + fine_prr_ms[cell_i];
+            rec.doppler[band] = (-total_prr / wavelength) as f32;
+        }
+        rec.snr[band] = cnr_dbhz[cell_i];
+        let mut lli = 0u8;
+        if lock_ind[cell_i] == 0 {
+            lli |= 0x01; // Loss of lock / cycle slip
+        }
+        if half_cyc[cell_i] {
+            lli |= 0x02; // Half-cycle ambiguity
+        }
+        rec.lli[band] = lli;
+    }
+
+    let mut records: Vec<ObsRecord> = by_sat.into_values().collect();
+    records.sort_by_key(|r| r.sat);
+
+    Some(MsmDecodedData {
+        msg_type,
+        constellation,
+        is_msm7,
+        station_id,
+        epoch_ms,
+        sync_flag,
+        iods,
+        records,
+    })
+}
+
 #[cfg(test)]
 mod tests {
     use super::*;
 
-    #[test]
-    fn test_rtcm3_crc24q_frame_decode() {
-        // Construit une trame RTCM3 valide de type 1077 (8 octets payload)
-        let mut payload = vec![0u8; 8];
-        // msg_type 1077 = 0x435 -> bits 0..12
-        payload[0] = 0x43;
-        payload[1] = 0x50;
-        let mut frame = vec![0xD3, 0x00, payload.len() as u8];
-        frame.extend_from_slice(&payload);
+    /// Encodeur de bits MSB-first pour générer des trames RTCM 3.3 MSM7 conformes dans les tests.
+    struct BitWriter {
+        bytes: Vec<u8>,
+        cur_byte: u8,
+        bit_count: u8,
+    }
+
+    impl BitWriter {
+        fn new() -> Self {
+            Self {
+                bytes: Vec::new(),
+                cur_byte: 0,
+                bit_count: 0,
+            }
+        }
+
+        fn write_u64(&mut self, val: u64, len: usize) {
+            for i in (0..len).rev() {
+                let bit = ((val >> i) & 1) as u8;
+                self.cur_byte = (self.cur_byte << 1) | bit;
+                self.bit_count += 1;
+                if self.bit_count == 8 {
+                    self.bytes.push(self.cur_byte);
+                    self.cur_byte = 0;
+                    self.bit_count = 0;
+                }
+            }
+        }
+
+        fn write_i64(&mut self, val: i64, len: usize) {
+            let mask = if len >= 64 { u64::MAX } else { (1u64 << len) - 1 };
+            self.write_u64((val as u64) & mask, len);
+        }
+
+        fn finish(mut self) -> Vec<u8> {
+            if self.bit_count > 0 {
+                self.cur_byte <<= 8 - self.bit_count;
+                self.bytes.push(self.cur_byte);
+            }
+            self.bytes
+        }
+    }
+
+    fn wrap_rtcm3_frame(payload: &[u8]) -> Vec<u8> {
+        let len = payload.len();
+        let mut frame = vec![0xD3, ((len >> 8) & 0x03) as u8, (len & 0xFF) as u8];
+        frame.extend_from_slice(payload);
         let crc = crc24q(&frame);
         frame.push(((crc >> 16) & 0xFF) as u8);
         frame.push(((crc >> 8) & 0xFF) as u8);
         frame.push((crc & 0xFF) as u8);
+        frame
+    }
+
+    #[test]
+    fn test_rtcm3_msm7_full_bit_decode_roundtrip() {
+        // Génère un message RTCM 1077 (GPS MSM7) complet pour 2 satellites (G05, G12) sur L1 (sig 2) + L2 (sig 15)
+        let pr_g05_l1 = 21_450_123.456_f64;
+        let cp_g05_l1_m = 21_450_123.512_f64;
+        let pr_g12_l1 = 22_890_654.321_f64;
+        let cp_g12_l1_m = 22_890_654.298_f64;
+
+        let mut bw = BitWriter::new();
+        bw.write_u64(1077, 12); // GPS MSM7
+        bw.write_u64(42, 12); // Station ID 42
+        bw.write_u64(123_456_000, 30); // Epoch TOW ms
+        bw.write_u64(0, 1); // sync_flag = false (fin d'époque)
+        bw.write_u64(1, 3); // IODS
+        bw.write_u64(0, 7); // reserved
+        bw.write_u64(0, 2); // clock steering
+        bw.write_u64(0, 2); // ext clock
+        bw.write_u64(0, 1); // smooth
+        bw.write_u64(0, 3); // smooth int
+
+        // Sat mask: PRN 5 (bit 63-4) & PRN 12 (bit 63-11)
+        let sat_mask = (1u64 << (63 - 4)) | (1u64 << (63 - 11));
+        bw.write_u64(sat_mask, 64);
+        // Signal mask: Sig 2 (L1C/A -> bit 31-1) & Sig 15 (L2C -> bit 31-14)
+        let sig_mask = (1u64 << (31 - 1)) | (1u64 << (31 - 14));
+        bw.write_u64(sig_mask, 32);
+
+        // Cell mask (2 sats * 2 sigs = 4 bits): G05(L1,L2), G12(L1 uniquement) -> 1, 1, 1, 0
+        bw.write_u64(0b1110, 4);
+
+        // Satellite rough ranges
+        let r0_ms_f = pr_g05_l1 / RANGE_MS;
+        let r0_int = r0_ms_f.floor() as u64;
+        let r0_mod = ((r0_ms_f - r0_int as f64) * 1024.0).floor() as u64;
+        let r0_base_m = (r0_int as f64 + r0_mod as f64 * P2_10) * RANGE_MS;
+
+        let r1_ms_f = pr_g12_l1 / RANGE_MS;
+        let r1_int = r1_ms_f.floor() as u64;
+        let r1_mod = ((r1_ms_f - r1_int as f64) * 1024.0).floor() as u64;
+        let r1_base_m = (r1_int as f64 + r1_mod as f64 * P2_10) * RANGE_MS;
+
+        bw.write_u64(r0_int, 8);
+        bw.write_u64(r1_int, 8);
+        // Extended sat info (4 bits * 2)
+        bw.write_u64(0, 4);
+        bw.write_u64(0, 4);
+        // Rough mod 1 ms (10 bits * 2)
+        bw.write_u64(r0_mod, 10);
+        bw.write_u64(r1_mod, 10);
+        // Rough phase range rate (14 bits signed * 2) : +250 m/s et -180 m/s
+        bw.write_i64(250, 14);
+        bw.write_i64(-180, 14);
+
+        // Fine pseudoranges (20 bits signed * 3 cells)
+        let fp0 = ((pr_g05_l1 - r0_base_m) / (P2_29 * RANGE_MS)).round() as i64;
+        let fp1 = ((pr_g05_l1 + 1.25 - r0_base_m) / (P2_29 * RANGE_MS)).round() as i64;
+        let fp2 = ((pr_g12_l1 - r1_base_m) / (P2_29 * RANGE_MS)).round() as i64;
+        bw.write_i64(fp0, 20);
+        bw.write_i64(fp1, 20);
+        bw.write_i64(fp2, 20);
+
+        // Fine phase ranges (24 bits signed * 3 cells)
+        let fc0 = ((cp_g05_l1_m - r0_base_m) / (P2_31 * RANGE_MS)).round() as i64;
+        let fc1 = ((cp_g05_l1_m + 1.25 - r0_base_m) / (P2_31 * RANGE_MS)).round() as i64;
+        let fc2 = ((cp_g12_l1_m - r1_base_m) / (P2_31 * RANGE_MS)).round() as i64;
+        bw.write_i64(fc0, 24);
+        bw.write_i64(fc1, 24);
+        bw.write_i64(fc2, 24);
+
+        // Lock time indicators (10 bits * 3)
+        bw.write_u64(120, 10);
+        bw.write_u64(120, 10);
+        bw.write_u64(0, 10); // Cycle slip sur G12!
+
+        // Half-cycle ambiguity (1 bit * 3)
+        bw.write_u64(0, 1);
+        bw.write_u64(0, 1);
+        bw.write_u64(1, 1);
+
+        // CNR (10 bits * 3, pas 0.0625 dB-Hz) -> 46.5, 43.25, 39.0 dB-Hz
+        bw.write_u64((46.5 * 16.0) as u64, 10);
+        bw.write_u64((43.25 * 16.0) as u64, 10);
+        bw.write_u64((39.0 * 16.0) as u64, 10);
+
+        // Fine phase range rate (15 bits signed * 3, pas 0.0001 m/s) -> +0.25, +0.25, -0.50 m/s
+        bw.write_i64(2500, 15);
+        bw.write_i64(2500, 15);
+        bw.write_i64(-5000, 15);
+
+        let payload = bw.finish();
+        let frame = wrap_rtcm3_frame(&payload);
 
         let mut dec = Rtcm3StreamDecoder::default();
         let msgs = dec.push_bytes(&frame);
         assert_eq!(dec.valid_frames, 1);
+        assert_eq!(dec.msm_frames_decoded, 1);
         assert_eq!(msgs.len(), 1);
-        assert!(matches!(msgs[0], Rtcm3Message::MsmHeader { msg_type: 1077, .. }));
+        assert!(dec.latest_base_epoch.is_some());
+
+        if let Rtcm3Message::MsmObservations(msm) = &msgs[0] {
+            assert_eq!(msm.msg_type, 1077);
+            assert_eq!(msm.station_id, 42);
+            assert!(msm.is_msm7);
+            assert_eq!(msm.records.len(), 2);
+
+            let g05 = &msm.records[0];
+            assert_eq!(g05.sat, SatId::new(Constellation::Gps, 5));
+            assert!((g05.pseudorange[0] - pr_g05_l1).abs() < 0.002);
+            assert!((g05.carrier_phase[0] * LAMBDA1 - cp_g05_l1_m).abs() < 0.001);
+            assert!((g05.pseudorange[1] - (pr_g05_l1 + 1.25)).abs() < 0.002);
+            assert!((g05.snr[0] - 46.5).abs() < 0.01);
+            assert!((g05.snr[1] - 43.25).abs() < 0.01);
+            assert_eq!(g05.lli[0], 0);
+            assert!((g05.doppler[0] as f64 - (-250.25 / LAMBDA1)).abs() < 0.05);
+
+            let g12 = &msm.records[1];
+            assert_eq!(g12.sat, SatId::new(Constellation::Gps, 12));
+            assert!((g12.pseudorange[0] - pr_g12_l1).abs() < 0.002);
+            assert_eq!(g12.lli[0], 0x03); // lock==0 (bit 0) + half_cycle (bit 1)
+            assert!((g12.snr[0] - 39.0).abs() < 0.01);
+        } else {
+            panic!("MsmObservations attendu");
+        }
     }
 }

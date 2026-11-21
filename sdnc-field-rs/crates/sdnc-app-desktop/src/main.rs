@@ -30,7 +30,8 @@ fn main() -> eframe::Result<()> {
         options,
         Box::new(move |cc| {
             cc.egui_ctx.set_visuals(egui::Visuals::dark());
-            Ok(Box::new(SdncFieldApp::new(project_dir)))
+            let target_fmt = cc.wgpu_render_state.as_ref().map(|rs| rs.target_format);
+            Ok(Box::new(SdncFieldApp::new_with_wgpu(project_dir, target_fmt)))
         }),
     )
 }
