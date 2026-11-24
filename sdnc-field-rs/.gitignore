@@ -1,0 +1,9 @@
+/target
+Cargo.lock
+/sdnc_workspace
+/gnss_logs
+/android/.gradle
+/android/build
+/android/app/build
+/android/app/src/main/jniLibs
+*.sqlite

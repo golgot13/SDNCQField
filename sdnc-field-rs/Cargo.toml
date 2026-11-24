@@ -1,0 +1,42 @@
+[workspace]
+resolver = "2"
+members = [
+    "crates/sdnc-geo",
+    "crates/sdnc-data",
+    "crates/sdnc-gpu",
+    "crates/sdnc-gnss",
+    "crates/sdnc-ui",
+    "crates/sdnc-app-desktop",
+    "crates/sdnc-app-android",
+]
+
+[workspace.package]
+version = "0.1.0"
+edition = "2021"
+license = "GPL-2.0-or-later"
+
+[workspace.dependencies]
+anyhow = "1.0"
+serde = { version = "1.0", features = ["derive"] }
+serde_json = "1.0"
+log = "0.4"
+env_logger = "0.11"
+chrono = { version = "0.4", features = ["serde"] }
+nalgebra = { version = "0.33", features = ["serde-serialize"] }
+bytemuck = { version = "1.21", features = ["derive"] }
+image = { version = "0.25", default-features = false, features = ["png", "jpeg", "tiff"] }
+tiff = "0.9"
+ureq = "2.10"
+rusqlite = { version = "0.32", features = ["bundled"] }
+wgpu = { version = "27.0", features = ["vulkan", "dx12", "wgsl"] }
+pollster = "0.4"
+egui = "0.33"
+egui-wgpu = "0.33"
+eframe = { version = "0.33", default-features = false, features = ["default_fonts", "wgpu", "wayland", "x11"] }
+rfd = "0.15"
+
+[profile.release]
+opt-level = 3
+lto = "thin"
+codegen-units = 1
+strip = "debuginfo"
