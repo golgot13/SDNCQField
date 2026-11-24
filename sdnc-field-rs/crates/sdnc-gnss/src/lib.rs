@@ -15,6 +15,7 @@ pub mod lambda;
 pub mod nmea;
 pub mod ntrip;
 pub mod ppk_solver;
+pub mod receivers;
 pub mod rinex;
 pub mod rtcm3;
 pub mod rtk_engine;
@@ -23,5 +24,6 @@ pub mod ubx;
 
 pub use controller::{GnssController, GnssLiveTelemetry};
 pub use ppk_solver::{run_ppk_files, run_ppk_in_memory, PpkJobConfig, PpkReport};
+pub use receivers::{ReceiverCapabilities, ReceiverProfile};
 pub use rtk_engine::RtkEngine;
 pub use types::*;

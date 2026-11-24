@@ -129,6 +129,20 @@ pub extern "system" fn Java_fr_sdnc_qfield_MainActivity_nativeOnRtcmBytes(
     }
 }
 
+/// Pont JNI permettant à `MainActivity.kt` de récupérer les commandes d'initialisation
+/// (UBX-CFG-VALSET F9P, M8T Reach L1, GREIS Sokkia) ou trames RTCM3 à écrire sur le socket Bluetooth SPP.
+#[cfg(target_os = "android")]
+#[no_mangle]
+pub extern "system" fn Java_fr_sdnc_qfield_MainActivity_nativePollOutgoingTxBytes(
+    env: jni::JNIEnv,
+    _class: jni::objects::JClass,
+) -> jni::sys::jbyteArray {
+    let bytes = shared_gnss_bridge().drain_outgoing_tx_bytes();
+    env.byte_array_from_slice(&bytes)
+        .map(|a| a.into_raw())
+        .unwrap_or(std::ptr::null_mut())
+}
+
 #[cfg(test)]
 mod tests {
     use super::*;

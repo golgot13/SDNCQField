@@ -15,11 +15,13 @@ use std::path::Path;
 #[derive(Debug, Clone, Default)]
 pub struct RinexObsFile {
     pub approx_position_ecef: Option<[f64; 3]>,
+    pub antenna_delta_h_m: f64,
     pub marker_name: String,
     pub epochs: Vec<ObsEpoch>,
 }
 
-/// Lit un fichier RINEX 3.x OBS (`.obs`, `.26o`, `.rnx`).
+/// Lit un fichier RINEX 3.x OBS (`.obs`, `.26o`, `.rnx`) multi-fréquences L1/L2/L5
+/// (compatible Emlid Reach, Leica, Trimble, Sokkia/Topcon, u-blox ZED-F9P et stations RGP IGN).
 pub fn read_rinex3_obs<P: AsRef<Path>>(path: P) -> Result<RinexObsFile> {
     let file = File::open(path.as_ref())
         .with_context(|| format!("Impossible d'ouvrir le fichier RINEX OBS {:?}", path.as_ref()))?;
@@ -27,6 +29,7 @@ pub fn read_rinex3_obs<P: AsRef<Path>>(path: P) -> Result<RinexObsFile> {
 
     let mut out = RinexObsFile::default();
     let mut sys_obs_types: HashMap<char, Vec<String>> = HashMap::new();
+    let mut last_sys_char: Option<char> = None;
     let mut in_header = true;
     let mut current_epoch: Option<ObsEpoch> = None;
 
@@ -48,16 +51,31 @@ pub fn read_rinex3_obs<P: AsRef<Path>>(path: P) -> Result<RinexObsFile> {
                 if parts.len() >= 3 {
                     out.approx_position_ecef = Some([parts[0], parts[1], parts[2]]);
                 }
+            } else if label.contains("ANTENNA: DELTA H/E/N") {
+                if let Some(h) = line[..line.len().min(60)]
+                    .split_whitespace()
+                    .next()
+                    .and_then(|s| s.parse::<f64>().ok())
+                {
+                    out.antenna_delta_h_m = h;
+                }
             } else if label.contains("SYS / # / OBS TYPES") {
                 let content = &line[..line.len().min(60)];
-                if let Some(sys_c) = content.chars().next() {
-                    if sys_c != ' ' {
-                        let tokens: Vec<String> = content[6..]
-                            .split_whitespace()
-                            .map(|s| s.to_string())
-                            .collect();
-                        sys_obs_types.entry(sys_c).or_default().extend(tokens);
-                    }
+                let first_c = content.chars().next().unwrap_or(' ');
+                let sys_c = if first_c != ' ' {
+                    last_sys_char = Some(first_c);
+                    Some(first_c)
+                } else {
+                    last_sys_char
+                };
+                if let Some(sc) = sys_c {
+                    let tokens: Vec<String> = content
+                        .get(6..)
+                        .unwrap_or("")
+                        .split_whitespace()
+                        .map(|s| s.to_string())
+                        .collect();
+                    sys_obs_types.entry(sc).or_default().extend(tokens);
                 }
             }
             continue;
@@ -104,26 +122,53 @@ pub fn read_rinex3_obs<P: AsRef<Path>>(path: P) -> Result<RinexObsFile> {
                         .get(start + 14..start + 15)
                         .and_then(|s| s.trim().parse().ok())
                         .unwrap_or(0);
+                    if val == 0.0 {
+                        continue;
+                    }
 
                     match code.as_str() {
-                        "C1C" | "C1W" | "C1X" | "C2I" => rec.pseudorange[0] = val,
-                        "L1C" | "L1W" | "L1X" | "L2I" => {
-                            rec.carrier_phase[0] = val;
-                            rec.lli[0] = lli_val;
+                        // Bande 0 : L1 / E1 / B1
+                        "C1C" | "C1W" | "C1X" | "C1P" | "C1S" | "C1L" | "C2I" => {
+                            if rec.pseudorange[0] == 0.0 {
+                                rec.pseudorange[0] = val;
+                            }
                         }
-                        "D1C" | "D1W" | "D1X" => rec.doppler[0] = val as f32,
-                        "S1C" | "S1W" | "S1X" => rec.snr[0] = val as f32,
-                        "C2W" | "C2L" | "C2X" => rec.pseudorange[1] = val,
-                        "L2W" | "L2L" | "L2X" => {
-                            rec.carrier_phase[1] = val;
-                            rec.lli[1] = lli_val;
+                        "L1C" | "L1W" | "L1X" | "L1P" | "L1S" | "L1L" | "L2I" => {
+                            if rec.carrier_phase[0] == 0.0 {
+                                rec.carrier_phase[0] = val;
+                                rec.lli[0] = lli_val;
+                            }
                         }
-                        "S2W" | "S2L" | "S2X" => rec.snr[1] = val as f32,
-                        "C5Q" | "C5X" => rec.pseudorange[2] = val,
-                        "L5Q" | "L5X" => {
+                        "D1C" | "D1W" | "D1X" | "D2I" => rec.doppler[0] = val as f32,
+                        "S1C" | "S1W" | "S1X" | "S2I" => rec.snr[0] = val as f32,
+
+                        // Bande 1 : L2 / E5b (7Q/7X) / B2 (7I/7X)
+                        "C2W" | "C2L" | "C2S" | "C2X" | "C2C" | "C2P" | "C7Q" | "C7I" | "C7X" => {
+                            if rec.pseudorange[1] == 0.0 {
+                                rec.pseudorange[1] = val;
+                            }
+                        }
+                        "L2W" | "L2L" | "L2S" | "L2X" | "L2C" | "L2P" | "L7Q" | "L7I" | "L7X" => {
+                            if rec.carrier_phase[1] == 0.0 {
+                                rec.carrier_phase[1] = val;
+                                rec.lli[1] = lli_val;
+                            }
+                        }
+                        "D2W" | "D2L" | "D2S" | "D2X" | "D2C" | "D7Q" | "D7I" => {
+                            rec.doppler[1] = val as f32
+                        }
+                        "S2W" | "S2L" | "S2S" | "S2X" | "S2C" | "S7Q" | "S7I" => {
+                            rec.snr[1] = val as f32
+                        }
+
+                        // Bande 2 : L5 / E5a
+                        "C5Q" | "C5X" | "C5I" => rec.pseudorange[2] = val,
+                        "L5Q" | "L5X" | "L5I" => {
                             rec.carrier_phase[2] = val;
                             rec.lli[2] = lli_val;
                         }
+                        "D5Q" | "D5X" => rec.doppler[2] = val as f32,
+                        "S5Q" | "S5X" => rec.snr[2] = val as f32,
                         _ => {}
                     }
                 }
@@ -303,7 +348,7 @@ impl Rinex3ObsWriter {
         for sys in ['G', 'E', 'R', 'C'] {
             writeln!(
                 writer,
-                "{}    4 C1C L1C D1C S1C                                      SYS / # / OBS TYPES",
+                "{}    8 C1C L1C D1C S1C C2W L2W D2W S2W                      SYS / # / OBS TYPES",
                 sys
             )?;
         }
@@ -322,8 +367,6 @@ impl Rinex3ObsWriter {
         let dt = chrono::DateTime::from_timestamp(epoch.time.sec, 0)
             .unwrap_or_default()
             .naive_utc();
-        let sec_f = dt.and_utc().timestamp() % 60;
-        let _ = sec_f;
         writeln!(
             self.writer,
             "> {:04} {:02} {:02} {:02} {:02} {:10.7}  0 {:2}",
@@ -336,19 +379,30 @@ impl Rinex3ObsWriter {
             epoch.records.len()
         )?;
         for r in &epoch.records {
+            let lli0 = if r.lli[0] > 0 {
+                r.lli[0].to_string()
+            } else {
+                " ".to_string()
+            };
+            let lli1 = if r.lli[1] > 0 {
+                r.lli[1].to_string()
+            } else {
+                " ".to_string()
+            };
             writeln!(
                 self.writer,
-                "{}{:14.3}  {:14.3}{} {:14.3}  {:14.3}",
+                "{}{:14.3}  {:14.3}{} {:14.3}  {:14.3}  {:14.3}  {:14.3}{} {:14.3}  {:14.3}",
                 r.sat.code(),
                 r.pseudorange[0],
                 r.carrier_phase[0],
-                if r.lli[0] > 0 {
-                    r.lli[0].to_string()
-                } else {
-                    " ".to_string()
-                },
+                lli0,
                 r.doppler[0],
-                r.snr[0]
+                r.snr[0],
+                r.pseudorange[1],
+                r.carrier_phase[1],
+                lli1,
+                r.doppler[1],
+                r.snr[1]
             )?;
         }
         self.epochs_written += 1;
@@ -368,11 +422,15 @@ mod tests {
     #[test]
     fn test_rinex3_obs_write_and_read_roundtrip() {
         let tmp = std::env::temp_dir().join("sdnc_test_rover.obs");
-        let mut w = Rinex3ObsWriter::create(&tmp, [4580000.0, 440000.0, 4370000.0], "ROVER_01").unwrap();
+        let mut w =
+            Rinex3ObsWriter::create(&tmp, [4580000.0, 440000.0, 4370000.0], "ROVER_01").unwrap();
         let mut rec = ObsRecord::new(SatId::new(Constellation::Gps, 5));
         rec.pseudorange[0] = 21_543_210.123;
         rec.carrier_phase[0] = 113_210_456.789;
         rec.snr[0] = 44.5;
+        rec.pseudorange[1] = 21_543_214.456;
+        rec.carrier_phase[1] = 88_216_543.210;
+        rec.snr[1] = 41.0;
         w.write_epoch(&ObsEpoch {
             time: GTime::from_ymdhms(2026, 11, 21, 10, 15, 30.0),
             records: vec![rec],
@@ -385,6 +443,8 @@ mod tests {
         assert_eq!(parsed.epochs.len(), 1);
         assert_eq!(parsed.epochs[0].records.len(), 1);
         assert!((parsed.epochs[0].records[0].pseudorange[0] - 21_543_210.123).abs() < 1e-3);
+        assert!((parsed.epochs[0].records[0].pseudorange[1] - 21_543_214.456).abs() < 1e-3);
+        assert!((parsed.epochs[0].records[0].carrier_phase[1] - 88_216_543.210).abs() < 1e-3);
         let _ = std::fs::remove_file(&tmp);
     }
 }

@@ -15,12 +15,11 @@ Reconstruction modulaire 100 % Rust de **SDNCQField** (PC Windows, PC Linux et A
   - **Raster WMTS** avec cache disque SQLite hors-ligne : BD ORTHO, Plan IGN v2, Cadastre PCI Image, Parcellaire Express, Estompage, Altimétrie MNT, OpenStreetMap
   - **Vecteurs WFS 2.0.0 GeoJSON** (`data.geopf.fr/wfs/ows`, `SRSNAME=CRS:84`) : Parcelles PCI Express, Bâtiments PCI Express, Feuilles/Sections PCI, BD TOPO v3 (Bâtiments, Routes, Cours d'eau, Communes) — sauvegardables hors-ligne dans le `.gpkg`
 - **Format de projet natif léger (`.sdnc.json` + `.gpkg`)** (`sdnc-data`) : provider OGC GeoPackage lecture/écriture complet (`rusqlite` bundled) + GeoJSON
-- **Moteur GNSS RTK & PPK adapté de RTKLIB en Rust pur** (`sdnc-gnss`) :
-  - Éphémérides Kepler, Sagnac, Saastamoinen, Klobuchar (`ephemeris.rs`)
-  - Résolution d'ambiguïtés entières **LAMBDA / MLAMBDA** + Ratio Test (`lambda.rs`)
-  - Filtre de Kalman Double-Différences **RTK Float / Fix** + SPP (`rtk_engine.rs`) + moyennage multi-époques
-  - Post-traitement **PPK Forward / Backward / Combined** sur RINEX 3 OBS & NAV (`ppk_solver.rs`, `rinex.rs`) + export CSV
-  - Flux temps réel **NTRIP v1/v2**, **RTCM 3.3 (CRC-24Q, 1005/1006, 1019/1046, MSM4/MSM7 bit-à-bit)**, **UBX (NAV-PVT / RXM-RAWX)**, **NMEA-0183**, **Bluetooth SPP / USB-Série Android** et pont JNI
+- **Pilotage GNSS RTK L1/L2/L5 multi-marques & Post-Traitement PPK (RTKLIB-Rust)** (`sdnc-gnss`) :
+  - **Pilotes & profils matériels dédiés** (`receivers.rs`) : **Leica** (GS18 T / GS16 / GS15 / GS07 / FLX100, `$GPLLQ`), **Trimble** (R12i / R12 / R10 / R8s / DA2, `$PTNL,GGK`), **Sokkia / Topcon** (GCX3 / GRX3 / HiPer VR, commandes GREIS/TPS), **SparkFun & modules u-blox ZED-F9P** (RTK Facet / Express / Torch, ArduSimple, initialisation `UBX-CFG-VALSET` L1+L2), **Emlid Reach complet** (Reach M+/RS+ **L1** M8T → M2 → RS2/RS2+ → RS3 → **RS4 Pro L1/L2/L5 + Tilt**)
+  - **Filtre de Kalman Double-Différences bi-fréquence L1+L2** + résolution entière **LAMBDA / MLAMBDA** + Ratio Test (`rtk_engine.rs`, `lambda.rs`) + moyennage multi-époques + compensation hauteur canne & offset ARP→APC
+  - **Post-traitement PPK complet** (`ppk_solver.rs`, `rinex.rs`, `ubx.rs`) : entrée directe **RINEX 3.04 L1/L2/L5** ou **binaire `.ubx` brut** (Emlid/F9P), modes **Cinématique Combined (Forward+Backward)** et **Statique (Pivot/Borne)**, recalage des événements terrain, import carte `.gpkg` & export CSV
+  - Flux temps réel **NTRIP v1/v2**, **RTCM 3.3 (CRC-24Q, 1005/1006, 1019/1046, MSM4/MSM7 bit-à-bit)**, **UBX (`NAV-PVT` / `RXM-RAWX` L1+L2+L5)**, **NMEA (`GGA`/`GST`/`GSA`/`GSV` Skyplot)**, **Bluetooth SPP bidirectionnel / USB-Série / TCP Wi-Fi** et pont JNI Android
 
 ## Architecture du workspace
 

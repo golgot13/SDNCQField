@@ -314,6 +314,31 @@ impl Default for GnssSolution {
     }
 }
 
+#[derive(Debug, Clone, Copy, PartialEq, Eq, Serialize, Deserialize, Default)]
+pub enum FrequencyBandMode {
+    /// Mono-fréquence L1 seul (ex. Emlid Reach M+/RS+ M8T)
+    L1Only,
+    /// Bi-fréquence L1 + L2 (ex. u-blox ZED-F9P, SparkFun, Emlid M2/RS2+/RS3, Leica, Trimble, Sokkia)
+    #[default]
+    L1L2,
+    /// Triple-fréquence L1 + L2 + L5 (ex. Emlid RS4 Pro, Leica GS18 T, Trimble R12i, Sokkia GRX3)
+    L1L2L5,
+}
+
+impl FrequencyBandMode {
+    pub fn label(&self) -> &'static str {
+        match self {
+            Self::L1Only => "L1 seul (Reach M+/RS+)",
+            Self::L1L2 => "L1 + L2 (F9P / RTK Bi-fréq.)",
+            Self::L1L2L5 => "L1 + L2 + L5 (RS4 Pro / GS18 / R12i)",
+        }
+    }
+
+    pub fn use_l2(&self) -> bool {
+        matches!(self, Self::L1L2 | Self::L1L2L5)
+    }
+}
+
 #[derive(Debug, Clone, Copy, PartialEq, Eq, Serialize, Deserialize)]
 pub enum GnssMode {
     Single,
@@ -360,35 +385,67 @@ impl Default for NtripConfig {
 
 #[derive(Debug, Clone, Serialize, Deserialize)]
 pub struct GnssConfig {
+    pub receiver_profile: crate::receivers::ReceiverProfile,
+    pub freq_mode: FrequencyBandMode,
     pub mode: GnssMode,
     pub source: ReceiverSource,
     pub tcp_host: String,
     pub tcp_port: u16,
     pub udp_port: u16,
-    /// Port série USB/COM pour u-blox ZED-F9P / Emlid Reach (ex. `/dev/ttyACM0` ou `COM3`)
+    /// Port série USB/COM pour u-blox ZED-F9P / SparkFun / Emlid / Leica / Trimble / Sokkia
     pub serial_port_path: String,
     pub serial_baud_rate: u32,
-    /// Récepteur Bluetooth externe Android SPP/BLE (ex. `Reach RS2+`, `u-blox ZED-F9P`)
+    /// Récepteur Bluetooth externe Android SPP/BLE (ex. `Reach RS4 Pro`, `Leica GS18`, `Trimble R12i`, `SparkFun RTK`)
     pub bluetooth_device_name: String,
     pub bluetooth_device_mac: String,
+    /// Fréquence de mesure souhaitée (1, 2, 5 ou 10 Hz) envoyée lors de l'initialisation
+    pub measurement_rate_hz: u8,
+    /// Envoyer automatiquement les commandes d'initialisation (UBX-CFG-VALSET / GREIS) à la connexion
+    pub auto_init_receiver: bool,
     pub elevation_mask_deg: f64,
     pub lambda_ratio_thresh: f64,
     pub code_sigma_m: f64,
     pub phase_sigma_m: f64,
+    /// Hauteur de canne mesurée (m)
     pub antenna_height_m: f64,
+    /// Décalage constructeur ARP -> APC (m) ajouté à `antenna_height_m`
+    pub antenna_arp_offset_m: f64,
     pub ntrip: NtripConfig,
     pub base_ecef_override: Option<[f64; 3]>,
     pub log_raw_ppk: bool,
     pub raw_ppk_output_path: String,
 }
 
+impl GnssConfig {
+    /// Applique un profil matériel constructeur (bandes L1/L2/L5, débit, port TCP, offset ARP, nom Bluetooth).
+    pub fn apply_receiver_profile(&mut self, profile: crate::receivers::ReceiverProfile) {
+        let cap = profile.capabilities();
+        self.receiver_profile = profile;
+        self.freq_mode = cap.default_freq_mode;
+        self.serial_baud_rate = cap.default_baud;
+        self.tcp_port = cap.default_tcp_port;
+        self.antenna_arp_offset_m = cap.default_arp_offset_m;
+        self.bluetooth_device_name = cap.bt_name_hint.to_string();
+        if self.source != ReceiverSource::SimulatedRtk {
+            self.source = cap.default_source;
+        }
+    }
+
+    /// Hauteur totale antenne au-dessus du point terrain (canne + offset interne ARP→APC).
+    pub fn total_antenna_height_m(&self) -> f64 {
+        self.antenna_height_m + self.antenna_arp_offset_m
+    }
+}
+
 impl Default for GnssConfig {
     fn default() -> Self {
         Self {
+            receiver_profile: crate::receivers::ReceiverProfile::UbloxZedF9p,
+            freq_mode: FrequencyBandMode::L1L2,
             mode: GnssMode::RtkKinematic,
             source: ReceiverSource::SimulatedRtk,
-            tcp_host: "127.0.0.1".to_string(),
-            tcp_port: 5000,
+            tcp_host: "192.168.42.1".to_string(),
+            tcp_port: 9000,
             udp_port: 5001,
             serial_port_path: if cfg!(target_os = "windows") {
                 "COM3".to_string()
@@ -396,13 +453,16 @@ impl Default for GnssConfig {
                 "/dev/ttyACM0".to_string()
             },
             serial_baud_rate: 115_200,
-            bluetooth_device_name: "Emlid Reach / u-blox ZED-F9P".to_string(),
+            bluetooth_device_name: "Emlid Reach / ZED-F9P / Leica / Trimble".to_string(),
             bluetooth_device_mac: String::new(),
+            measurement_rate_hz: 5,
+            auto_init_receiver: true,
             elevation_mask_deg: 15.0,
             lambda_ratio_thresh: 3.0,
             code_sigma_m: 0.3,
             phase_sigma_m: 0.003,
             antenna_height_m: 2.0,
+            antenna_arp_offset_m: 0.0,
             ntrip: NtripConfig::default(),
             base_ecef_override: None,
             log_raw_ppk: false,

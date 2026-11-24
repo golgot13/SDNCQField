@@ -11,25 +11,26 @@ use crate::ephemeris::{geodist, iono_klobuchar, satazel, satpos_kepler, trop_saa
 use crate::lambda::lambda_resolve;
 use crate::types::{
     FixQuality, GnssConfig, GnssMode, GnssSolution, GTime, NavData, ObsEpoch, ObsRecord, SatId,
-    SatSkyInfo, CLIGHT, LAMBDA1,
+    SatSkyInfo, CLIGHT, LAMBDA1, LAMBDA2,
 };
 use nalgebra::{DMatrix, DVector};
 use sdnc_geo::{ecef_to_geodetic_h, WGS84};
 use std::collections::HashMap;
 
-/// État interne du filtre de Kalman RTK (équivalent `rtk_t` RTKLIB).
+/// État interne du filtre de Kalman RTK L1 / L1+L2 (équivalent `rtk_t` RTKLIB).
 pub struct RtkEngine {
     pub config: GnssConfig,
     /// Position ECEF estimée (m)
     pub pos_ecef: [f64; 3],
     /// Covariance 3x3 de la position ECEF
     pub pos_cov: [[f64; 3]; 3],
-    /// Ambiguïtés double-différence par satellite (en cycles L1) : `(valeur, variance)`
-    pub sd_biases: HashMap<SatId, (f64, f64)>,
+    /// Ambiguïtés double-différence par `(satellite, bande [0=L1, 1=L2])` : `(valeur cycles, variance)`
+    pub sd_biases: HashMap<(SatId, u8), (f64, f64)>,
     pub last_ref_sat: Option<SatId>,
     pub last_time: Option<GTime>,
     pub initialized: bool,
     pub fix_count: u32,
+    pub last_used_l2: bool,
 }
 
 impl RtkEngine {
@@ -43,6 +44,7 @@ impl RtkEngine {
             last_time: None,
             initialized: false,
             fix_count: 0,
+            last_used_l2: false,
         }
     }
 
@@ -321,7 +323,32 @@ impl RtkEngine {
             self.last_ref_sat = Some(ref_sat.sat);
         }
         let other_sats = &common[1..];
-        let nb = other_sats.len(); // Nombre d'ambiguïtés double-différences (m - 1)
+        let use_l2_band = self.config.freq_mode.use_l2()
+            && ref_sat.rov.pseudorange[1] > 1e6
+            && ref_sat.bas.pseudorange[1] > 1e6
+            && ref_sat.rov.carrier_phase[1].abs() >= 1.0
+            && ref_sat.bas.carrier_phase[1].abs() >= 1.0;
+
+        // Liste des paires double-différences actives : (index dans other_sats, band [0=L1, 1=L2], lambda)
+        let mut dd_pairs: Vec<(usize, u8, f64)> = Vec::with_capacity(other_sats.len() * 2);
+        for k in 0..other_sats.len() {
+            dd_pairs.push((k, 0, LAMBDA1));
+        }
+        let mut l2_count = 0usize;
+        if use_l2_band {
+            for (k, s) in other_sats.iter().enumerate() {
+                if s.rov.pseudorange[1] > 1e6
+                    && s.bas.pseudorange[1] > 1e6
+                    && s.rov.carrier_phase[1].abs() >= 1.0
+                    && s.bas.carrier_phase[1].abs() >= 1.0
+                {
+                    dd_pairs.push((k, 1, LAMBDA2));
+                    l2_count += 1;
+                }
+            }
+        }
+        self.last_used_l2 = l2_count >= 3;
+        let nb = dd_pairs.len(); // Nombre total d'ambiguïtés double-différences (L1 + éventuel L2)
 
         // 4. Construction du vecteur d'état EKF : x = [rx, ry, rz, dd_N_0, ..., dd_N_{nb-1}]
         let nx = 3 + nb;
@@ -334,19 +361,30 @@ impl RtkEngine {
             }
         }
 
-        // Initialisation / maintien des ambiguïtés double-différences (détection cycle slip LLI)
-        let ref_sd_p = ref_sat.rov.pseudorange[0] - ref_sat.bas.pseudorange[0];
-        let ref_sd_l = ref_sat.rov.carrier_phase[0] - ref_sat.bas.carrier_phase[0];
-        let ref_slip = (ref_sat.rov.lli[0] & 1) != 0 || (ref_sat.bas.lli[0] & 1) != 0;
+        // Initialisation / maintien des ambiguïtés double-différences (détection cycle slip LLI par bande)
+        let ref_sd_p = [
+            ref_sat.rov.pseudorange[0] - ref_sat.bas.pseudorange[0],
+            ref_sat.rov.pseudorange[1] - ref_sat.bas.pseudorange[1],
+        ];
+        let ref_sd_l = [
+            ref_sat.rov.carrier_phase[0] - ref_sat.bas.carrier_phase[0],
+            ref_sat.rov.carrier_phase[1] - ref_sat.bas.carrier_phase[1],
+        ];
+        let ref_slip = [
+            (ref_sat.rov.lli[0] & 1) != 0 || (ref_sat.bas.lli[0] & 1) != 0,
+            (ref_sat.rov.lli[1] & 1) != 0 || (ref_sat.bas.lli[1] & 1) != 0,
+        ];
 
-        for (k, s) in other_sats.iter().enumerate() {
-            let slip = ref_slip || (s.rov.lli[0] & 1) != 0 || (s.bas.lli[0] & 1) != 0;
-            let sd_p = s.rov.pseudorange[0] - s.bas.pseudorange[0];
-            let sd_l = s.rov.carrier_phase[0] - s.bas.carrier_phase[0];
-            let dd_n_init = (sd_l - ref_sd_l) - (sd_p - ref_sd_p) / LAMBDA1;
+        for (idx, &(k, band, lam)) in dd_pairs.iter().enumerate() {
+            let s = &other_sats[k];
+            let b = band as usize;
+            let slip = ref_slip[b] || (s.rov.lli[b] & 1) != 0 || (s.bas.lli[b] & 1) != 0;
+            let sd_p = s.rov.pseudorange[b] - s.bas.pseudorange[b];
+            let sd_l = s.rov.carrier_phase[b] - s.bas.carrier_phase[b];
+            let dd_n_init = (sd_l - ref_sd_l[b]) - (sd_p - ref_sd_p[b]) / lam;
 
             let (val, var) = if !slip {
-                if let Some(&(prev_v, prev_var)) = self.sd_biases.get(&s.sat) {
+                if let Some(&(prev_v, prev_var)) = self.sd_biases.get(&(s.sat, band)) {
                     (prev_v, prev_var + 1e-8 * dt)
                 } else {
                     (dd_n_init, 900.0)
@@ -354,11 +392,11 @@ impl RtkEngine {
             } else {
                 (dd_n_init, 900.0)
             };
-            x[3 + k] = val;
-            p[(3 + k, 3 + k)] = var;
+            x[3 + idx] = val;
+            p[(3 + idx, 3 + idx)] = var;
         }
 
-        // 5. Formation des mesures Double-Différences : [nb phases, nb codes]
+        // 5. Formation des mesures Double-Différences : [nb phases, nb codes] (L1 et L2)
         let nv = 2 * nb;
         let mut h_mat = DMatrix::<f64>::zeros(nv, nx);
         let mut v_vec = DVector::<f64>::zeros(nv);
@@ -368,12 +406,14 @@ impl RtkEngine {
         let sig_p_ref = self.config.code_sigma_m / ref_sat.el.sin().max(0.15);
         let sig_l_ref = self.config.phase_sigma_m / ref_sat.el.sin().max(0.15);
 
-        for (k, s) in other_sats.iter().enumerate() {
+        for (idx, &(k, band, lam)) in dd_pairs.iter().enumerate() {
+            let s = &other_sats[k];
+            let b = band as usize;
             let sat_geo_sd = s.r_rov - s.r_bas;
             let dd_geo = sat_geo_sd - ref_geo_sd;
 
-            let dd_l_m = ((s.rov.carrier_phase[0] - s.bas.carrier_phase[0]) - ref_sd_l) * LAMBDA1;
-            let dd_p_m = (s.rov.pseudorange[0] - s.bas.pseudorange[0]) - ref_sd_p;
+            let dd_l_m = ((s.rov.carrier_phase[b] - s.bas.carrier_phase[b]) - ref_sd_l[b]) * lam;
+            let dd_p_m = (s.rov.pseudorange[b] - s.bas.pseudorange[b]) - ref_sd_p[b];
 
             // Dérivée partielle par rapport à rr : -(los_sat - los_ref)
             let dlos = [
@@ -382,28 +422,30 @@ impl RtkEngine {
                 -(s.los[2] - ref_sat.los[2]),
             ];
 
-            // Ligne phase porteuse (indice k)
+            // Ligne phase porteuse (indice idx)
             for j in 0..3 {
-                h_mat[(k, j)] = dlos[j];
+                h_mat[(idx, j)] = dlos[j];
             }
-            h_mat[(k, 3 + k)] = LAMBDA1;
-            v_vec[k] = dd_l_m - (dd_geo + LAMBDA1 * x[3 + k]);
+            h_mat[(idx, 3 + idx)] = lam;
+            v_vec[idx] = dd_l_m - (dd_geo + lam * x[3 + idx]);
 
-            // Ligne code pseudorange (indice nb + k)
+            // Ligne code pseudorange (indice nb + idx)
             for j in 0..3 {
-                h_mat[(nb + k, j)] = dlos[j];
+                h_mat[(nb + idx, j)] = dlos[j];
             }
-            v_vec[nb + k] = dd_p_m - dd_geo;
+            v_vec[nb + idx] = dd_p_m - dd_geo;
 
-            // Bruit de mesure corrélé par le satellite de référence
+            // Bruit de mesure corrélé par le satellite de référence au sein de la même bande
             let sig_l_k = self.config.phase_sigma_m / s.el.sin().max(0.15);
             let sig_p_k = self.config.code_sigma_m / s.el.sin().max(0.15);
-            for j in 0..nb {
-                r_mat[(k, j)] = 2.0 * sig_l_ref * sig_l_ref;
-                r_mat[(nb + k, nb + j)] = 2.0 * sig_p_ref * sig_p_ref;
+            for (j_idx, &(_, j_band, _)) in dd_pairs.iter().enumerate() {
+                if j_band == band {
+                    r_mat[(idx, j_idx)] = 2.0 * sig_l_ref * sig_l_ref;
+                    r_mat[(nb + idx, nb + j_idx)] = 2.0 * sig_p_ref * sig_p_ref;
+                }
             }
-            r_mat[(k, k)] += 2.0 * sig_l_k * sig_l_k;
-            r_mat[(nb + k, nb + k)] += 2.0 * sig_p_k * sig_p_k;
+            r_mat[(idx, idx)] += 2.0 * sig_l_k * sig_l_k;
+            r_mat[(nb + idx, nb + idx)] += 2.0 * sig_p_k * sig_p_k;
         }
 
         // 6. Mise à jour Kalman (Measurement Update) : K = P H^T (H P H^T + R)^-1
@@ -426,9 +468,12 @@ impl RtkEngine {
             }
         }
         self.sd_biases.clear();
-        for (k, s) in other_sats.iter().enumerate() {
-            self.sd_biases
-                .insert(s.sat, (x_float[3 + k], p_float[(3 + k, 3 + k)].max(1e-6)));
+        for (idx, &(k, band, _)) in dd_pairs.iter().enumerate() {
+            let s = &other_sats[k];
+            self.sd_biases.insert(
+                (s.sat, band),
+                (x_float[3 + idx], p_float[(3 + idx, 3 + idx)].max(1e-6)),
+            );
         }
 
         // 7. Tentative de résolution entière LAMBDA (Float -> Fix)

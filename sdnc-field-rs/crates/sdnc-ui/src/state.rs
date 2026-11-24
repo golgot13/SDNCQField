@@ -140,6 +140,8 @@ pub struct SdncFieldApp {
     pub ppk_base_path: String,
     pub ppk_nav_path: String,
     pub ppk_combined: bool,
+    pub ppk_static_mode: bool,
+    pub ppk_base_antenna_h_m: f64,
 
     pub draft_vertices: Vec<Coordinate>,
     pub pending_form: Option<PendingAttributeForm>,
@@ -230,6 +232,8 @@ impl SdncFieldApp {
                 .to_string_lossy()
                 .to_string(),
             ppk_combined: true,
+            ppk_static_mode: false,
+            ppk_base_antenna_h_m: 0.0,
             draft_vertices: Vec::new(),
             pending_form: None,
             identified_info: None,
@@ -570,7 +574,7 @@ impl SdncFieldApp {
                 .gnss
                 .config
                 .lock()
-                .map(|c| c.antenna_height_m)
+                .map(|c| c.total_antenna_height_m())
                 .unwrap_or(0.0);
             let z = tel.solution.alt_orthometric_m - ant_h;
             sess.samples.push((wx, wy, z));
@@ -983,7 +987,7 @@ impl SdncFieldApp {
                 .gnss
                 .config
                 .lock()
-                .map(|c| c.antenna_height_m)
+                .map(|c| c.total_antenna_height_m())
                 .unwrap_or(0.0);
             let z = tel.solution.alt_orthometric_m - ant_h;
             let geom = Geometry::Point {
@@ -993,7 +997,7 @@ impl SdncFieldApp {
         }
     }
 
-    /// Importe la dernière trajectoire PPK post-traitée comme couche vectorielle dans le projet.
+    /// Importe la dernière trajectoire PPK post-traitée (et pivot statique / événements recalés) en couche GeoPackage.
     pub fn import_ppk_report_as_layer(&mut self, tel: &GnssLiveTelemetry) {
         let Some(report) = &tel.last_ppk_report else {
             return;
@@ -1016,7 +1020,27 @@ impl SdncFieldApp {
                 fc.add_feature(pt);
             }
         }
-        if line_coords.len() >= 2 {
+        if let Some(ref st) = report.static_solution {
+            if let Ok((wx, wy)) = from_wgs84(crs, st.lon_deg, st.lat_deg) {
+                let mut pt = Feature::with_geometry(Geometry::Point {
+                    coordinates: Coordinate::new_3d(wx, wy, st.alt_orthometric_m),
+                });
+                pt.set_property("nom", "PPK_PIVOT_STATIQUE");
+                pt.set_property("gnss_statut", st.quality.label());
+                fc.add_feature(pt);
+            }
+        }
+        for (ev_label, ev_sol) in &report.event_solutions {
+            if let Ok((wx, wy)) = from_wgs84(crs, ev_sol.lon_deg, ev_sol.lat_deg) {
+                let mut pt = Feature::with_geometry(Geometry::Point {
+                    coordinates: Coordinate::new_3d(wx, wy, ev_sol.alt_orthometric_m),
+                });
+                pt.set_property("nom", ev_label.clone());
+                pt.set_property("gnss_statut", ev_sol.quality.label());
+                fc.add_feature(pt);
+            }
+        }
+        if line_coords.len() >= 2 && report.static_solution.is_none() {
             let mut trk = Feature::with_geometry(Geometry::LineString {
                 coordinates: line_coords,
             });
@@ -1025,10 +1049,11 @@ impl SdncFieldApp {
         }
 
         let table_name = format!("ppk_track_{}", self.layers.len() + 1);
+        let band_tag = if report.used_dual_freq_l1_l2 { "L1+L2" } else { "L1" };
         self.layers.push(RuntimeLayer {
             spec: ProjectLayerSpec {
                 id: table_name.clone(),
-                name: format!("Trajectoire PPK ({:.0}% FIX)", report.fix_rate_pct),
+                name: format!("PPK {} ({:.0}% FIX)", band_tag, report.fix_rate_pct),
                 source: LayerSource::GeoPackageTable {
                     gpkg_rel_path: self.project.gpkg_file.clone(),
                     table_name,
@@ -1042,7 +1067,7 @@ impl SdncFieldApp {
                     fill_rgba: [40, 240, 120, 180],
                     stroke_width: 2.5,
                     point_radius: 4.5,
-                    label_field: None,
+                    label_field: Some("nom".to_string()),
                 },
                 form_fields: sdnc_data::default_field_form(),
             },
@@ -1051,8 +1076,10 @@ impl SdncFieldApp {
         });
         self.mark_vector_gpu_dirty();
         self.status_banner = format!(
-            "Trajectoire PPK ({} époques) ajoutée au projet (prête à sauvegarder en .gpkg)",
-            report.total_epochs
+            "PPK {} ({} époques, {} events) ajouté au projet (prêt à sauvegarder en .gpkg)",
+            band_tag,
+            report.total_epochs,
+            report.event_solutions.len()
         );
     }
 
@@ -1063,12 +1090,24 @@ impl SdncFieldApp {
             .lock()
             .unwrap_or_else(|e| e.into_inner())
             .clone();
+        let events: Vec<(String, sdnc_gnss::GTime)> = self
+            .gnss
+            .snapshot()
+            .event_markers
+            .into_iter()
+            .map(|(lbl, sol)| (lbl, sol.time))
+            .collect();
+        let rover_antenna_h_m = cfg.total_antenna_height_m();
         let job = PpkJobConfig {
             rover_obs_path: self.ppk_rover_path.clone(),
             base_obs_path: self.ppk_base_path.clone(),
             nav_path: self.ppk_nav_path.clone(),
             base_ecef_override: cfg.base_ecef_override,
             combined_forward_backward: self.ppk_combined,
+            static_mode: self.ppk_static_mode,
+            rover_antenna_h_m,
+            base_antenna_h_m: self.ppk_base_antenna_h_m,
+            event_timestamps: events,
             gnss_config: cfg,
         };
         self.gnss.run_ppk_files_async(job);

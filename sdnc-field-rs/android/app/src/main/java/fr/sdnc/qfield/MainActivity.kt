@@ -39,6 +39,7 @@ class MainActivity : GameActivity(), LocationListener {
 
     private external fun nativeOnExternalGnssBytes(data: ByteArray)
     private external fun nativeOnRtcmBytes(data: ByteArray)
+    private external fun nativePollOutgoingTxBytes(): ByteArray?
 
     private var locationManager: LocationManager? = null
     private var btSocket: BluetoothSocket? = null
@@ -79,8 +80,8 @@ class MainActivity : GameActivity(), LocationListener {
         autoConnectPairedExternalGnss()
     }
 
-    /// Recherche un récepteur externe appairé (u-blox / Emlid Reach / Septentrio / ArduSimple)
-    /// et ouvre une liaison RFCOMM SPP streaming les paquets UBX/NMEA vers Rust via JNI.
+    /// Recherche un récepteur externe appairé (Leica, Trimble, Sokkia/Topcon, SparkFun, u-blox ZED-F9P,
+    /// Emlid Reach L1/M2/RS2+/RS3/RS4 Pro, Septentrio, ArduSimple) et ouvre une liaison RFCOMM SPP bidirectionnelle.
     private fun autoConnectPairedExternalGnss() {
         if (Build.VERSION.SDK_INT >= Build.VERSION_CODES.S &&
             ActivityCompat.checkSelfPermission(this, Manifest.permission.BLUETOOTH_CONNECT) != PackageManager.PERMISSION_GRANTED
@@ -91,7 +92,14 @@ class MainActivity : GameActivity(), LocationListener {
         val adapter: BluetoothAdapter = btManager.adapter ?: return
         if (!adapter.isEnabled) return
 
-        val keywords = listOf("reach", "emlid", "ublox", "u-blox", "zed-f9p", "gnss", "rtk", "ardusimple")
+        val keywords = listOf(
+            "reach", "emlid", "rs4", "rs3", "rs2",
+            "leica", "gs18", "gs16", "gs15", "gs07", "flx100",
+            "trimble", "r12", "r10", "r8s", "da2", "catalyst",
+            "sokkia", "gcx", "grx", "gsx", "topcon", "hiper",
+            "sparkfun", "facet", "torch", "express",
+            "ublox", "u-blox", "zed-f9p", "f9p", "ardusimple", "septentrio", "gnss", "rtk"
+        )
         val target: BluetoothDevice = adapter.bondedDevices.firstOrNull { dev ->
             val name = dev.name?.lowercase() ?: ""
             keywords.any { kw -> name.contains(kw) }
@@ -118,13 +126,23 @@ class MainActivity : GameActivity(), LocationListener {
                 val buf = ByteArray(2048)
 
                 while (btRunning.get() && socket.isConnected) {
-                    val n = input.read(buf)
-                    if (n > 0) {
-                        nativeOnExternalGnssBytes(buf.copyOf(n))
+                    val tx = nativePollOutgoingTxBytes()
+                    if (tx != null && tx.isNotEmpty()) {
+                        btOutStream?.write(tx)
+                        btOutStream?.flush()
+                    }
+                    if (input.available() > 0) {
+                        val n = input.read(buf)
+                        if (n > 0) {
+                            nativeOnExternalGnssBytes(buf.copyOf(n))
+                        }
+                    } else {
+                        Thread.sleep(25)
                     }
                 }
             } catch (_: IOException) {
                 // Déconnexion propre en cas de coupure radio/Bluetooth
+            } catch (_: InterruptedException) {
             } finally {
                 disconnectBluetoothGnss()
             }

@@ -1,15 +1,24 @@
-//! Panneau de pilotage GNSS RTK & PPK (RTKLIB adapté en Rust) intégré dans l'interface terrain.
+//! Panneau de pilotage GNSS RTK (L1 / L1+L2 / L1+L2+L5) & Post-Traitement PPK (RTKLIB-Rust).
+//!
+//! Pilote les récepteurs :
+//! - **Leica** (GS18 T / GS16 / GS15 / GS07 / FLX100)
+//! - **Trimble** (R12i / R12 / R10 / R8s / DA2)
+//! - **Sokkia / Topcon** (GCX3 / GRX3 / HiPer VR)
+//! - **SparkFun & modules u-blox ZED-F9P** (RTK Facet / Express / Torch, ArduSimple simpleRTK2B)
+//! - **Emlid Reach** (gamme complète : Reach M+/RS+ L1 → M2 → RS2/RS2+ → RS3 → **RS4 Pro**)
 
 use crate::state::SdncFieldApp;
 use egui::{Color32, Pos2, RichText, Stroke, Vec2};
-use sdnc_gnss::{FixQuality, GnssLiveTelemetry, GnssMode, ReceiverSource};
+use sdnc_gnss::{
+    FixQuality, FrequencyBandMode, GnssLiveTelemetry, GnssMode, ReceiverProfile, ReceiverSource,
+};
 
 pub fn render_gnss_panel(ui: &mut egui::Ui, app: &mut SdncFieldApp, tel: &GnssLiveTelemetry) {
     egui::ScrollArea::vertical().show(ui, |ui| {
-        ui.heading("GNSS RTK / PPK (RTKLIB-Rust)");
+        ui.heading("GNSS RTK L1/L2 & PPK");
         ui.separator();
 
-        // 1. Carte d'état temps réel (FixQuality, précision, LAMBDA Ratio)
+        // 1. Carte d'état temps réel (FixQuality, bandes L1/L2, précision, LAMBDA Ratio)
         let q = tel.solution.quality;
         let rgb = q.color_rgb();
         let badge_col = Color32::from_rgb(rgb[0], rgb[1], rgb[2]);
@@ -19,13 +28,20 @@ pub fn render_gnss_panel(ui: &mut egui::Ui, app: &mut SdncFieldApp, tel: &GnssLi
             .stroke(Stroke::new(1.5_f32, badge_col))
             .show(ui, |ui| {
                 ui.horizontal(|ui| {
-                    ui.label(RichText::new(q.label()).strong().size(16.0).color(badge_col));
+                    ui.label(RichText::new(q.label()).strong().size(15.5).color(badge_col));
                     ui.with_layout(egui::Layout::right_to_left(egui::Align::Center), |ui| {
                         ui.label(
                             RichText::new(format!("{} sats", tel.solution.num_sats))
                                 .strong()
                                 .color(Color32::WHITE),
                         );
+                        let band_txt = if tel.dual_freq_active { "L1+L2" } else { "L1" };
+                        let band_col = if tel.dual_freq_active {
+                            Color32::from_rgb(90, 235, 255)
+                        } else {
+                            Color32::from_rgb(240, 200, 90)
+                        };
+                        ui.label(RichText::new(band_txt).strong().size(11.0).color(band_col));
                     });
                 });
 
@@ -103,7 +119,7 @@ pub fn render_gnss_panel(ui: &mut egui::Ui, app: &mut SdncFieldApp, tel: &GnssLi
                 let idx = tel.event_markers.len() + 1;
                 app.gnss.mark_event(format!("EVT_{:03}", idx));
             }
-            if ui.button("Effacer trace").clicked() {
+            if ui.button("Effacer").clicked() {
                 app.gnss.clear_track();
             }
         });
@@ -152,15 +168,8 @@ pub fn render_gnss_panel(ui: &mut egui::Ui, app: &mut SdncFieldApp, tel: &GnssLi
 
         ui.add_space(6.0);
 
-        // 3. Skyplot Polaire & Barres C/N0 (SNR)
-        egui::CollapsingHeader::new("Skyplot Constellation & SNR")
-            .default_open(true)
-            .show(ui, |ui| {
-                render_skyplot(ui, tel);
-            });
-
-        // 4. Configuration du moteur RTKLIB-Rust (Source, Mode, Paramètres)
-        egui::CollapsingHeader::new("Configuration Moteur RTKLIB")
+        // 3. Pilote Matériel Récepteur RTK (Leica, Trimble, Sokkia, SparkFun F9P, Emlid Reach L1 → RS4 Pro)
+        egui::CollapsingHeader::new("📡 Pilote Récepteur RTK (Marques & L1/L2)")
             .default_open(true)
             .show(ui, |ui| {
                 let mut cfg = app
@@ -171,21 +180,123 @@ pub fn render_gnss_panel(ui: &mut egui::Ui, app: &mut SdncFieldApp, tel: &GnssLi
                     .clone();
                 let mut changed = false;
 
-                egui::ComboBox::from_label("Source")
+                let current_profile = cfg.receiver_profile;
+                let mut selected_profile = current_profile;
+                egui::ComboBox::from_label("Modèle")
+                    .selected_text(current_profile.label())
+                    .show_ui(ui, |ui| {
+                        for &prof in ReceiverProfile::ALL {
+                            ui.selectable_value(&mut selected_profile, prof, prof.label());
+                        }
+                    });
+                if selected_profile != current_profile {
+                    cfg.apply_receiver_profile(selected_profile);
+                    changed = true;
+                }
+
+                let cap = cfg.receiver_profile.capabilities();
+                ui.label(
+                    RichText::new(format!(
+                        "Bandes : {} {}",
+                        cap.bands_label,
+                        if cap.supports_imu_tilt { "· IMU Tilt" } else { "" }
+                    ))
+                    .size(10.5)
+                    .color(Color32::from_rgb(130, 230, 255)),
+                );
+                ui.label(
+                    RichText::new(cap.protocols_summary)
+                        .size(10.0)
+                        .color(Color32::GRAY),
+                );
+
+                // Bandes de fréquences actives (L1 seul / L1+L2 / L1+L2+L5)
+                egui::ComboBox::from_label("Fréquences")
+                    .selected_text(cfg.freq_mode.label())
+                    .show_ui(ui, |ui| {
+                        for fm in [
+                            FrequencyBandMode::L1Only,
+                            FrequencyBandMode::L1L2,
+                            FrequencyBandMode::L1L2L5,
+                        ] {
+                            changed |= ui
+                                .selectable_value(&mut cfg.freq_mode, fm, fm.label())
+                                .changed();
+                        }
+                    });
+
+                ui.horizontal(|ui| {
+                    ui.label("Cadence :");
+                    for hz in [1u8, 2, 5, 10] {
+                        changed |= ui
+                            .selectable_value(&mut cfg.measurement_rate_hz, hz, format!("{} Hz", hz))
+                            .changed();
+                    }
+                });
+
+                changed |= ui
+                    .checkbox(
+                        &mut cfg.auto_init_receiver,
+                        "Auto-init (UBX-CFG-VALSET F9P / M8T / GREIS)",
+                    )
+                    .changed();
+
+                if changed {
+                    *app.gnss.config.lock().unwrap_or_else(|e| e.into_inner()) = cfg.clone();
+                }
+
+                if ui
+                    .button("⚡ Envoyer commandes Init au récepteur")
+                    .on_hover_text(
+                        "Configure automatiquement NAV-PVT, RXM-RAWX L1/L2 (PPK), NMEA GGA/GST et entrée RTCM3",
+                    )
+                    .clicked()
+                {
+                    app.gnss.queue_receiver_init_commands();
+                }
+            });
+
+        // 4. Liaison & Moteur RTKLIB (Source, Mode, Hauteur canne + ARP)
+        egui::CollapsingHeader::new("⚙ Liaison & Moteur RTKLIB-Rust")
+            .default_open(true)
+            .show(ui, |ui| {
+                let mut cfg = app
+                    .gnss
+                    .config
+                    .lock()
+                    .unwrap_or_else(|e| e.into_inner())
+                    .clone();
+                let mut changed = false;
+
+                egui::ComboBox::from_label("Liaison")
                     .selected_text(format!("{:?}", cfg.source))
                     .show_ui(ui, |ui| {
                         changed |= ui
                             .selectable_value(
                                 &mut cfg.source,
                                 ReceiverSource::SimulatedRtk,
-                                "Simulateur RTK (EKF+LAMBDA)",
+                                "Simulateur RTK L1/L2 (EKF+LAMBDA)",
+                            )
+                            .changed();
+                        changed |= ui
+                            .selectable_value(
+                                &mut cfg.source,
+                                ReceiverSource::BluetoothExternal,
+                                "Bluetooth SPP (Leica/Trimble/Sokkia/Reach/F9P)",
+                            )
+                            .changed();
+                        changed |= ui
+                            .selectable_value(
+                                &mut cfg.source,
+                                ReceiverSource::SerialPort,
+                                "Port Série USB/COM (ZED-F9P / SparkFun / Sokkia)",
                             )
                             .changed();
                         changed |= ui
                             .selectable_value(
                                 &mut cfg.source,
                                 ReceiverSource::TcpStream,
-                                "TCP Récepteur (NMEA/UBX)",
+                                "TCP Wi-Fi (Emlid Reach L1→RS4 Pro / Base)",
                             )
                             .changed();
                         changed |= ui
@@ -193,20 +304,6 @@ pub fn render_gnss_panel(ui: &mut egui::Ui, app: &mut SdncFieldApp, tel: &GnssLi
                                 &mut cfg.source,
                                 ReceiverSource::UdpStream,
                                 "UDP Récepteur (NMEA)",
-                            )
-                            .changed();
-                        changed |= ui
-                            .selectable_value(
-                                &mut cfg.source,
-                                ReceiverSource::SerialPort,
-                                "Port Série USB (u-blox / Emlid)",
-                            )
-                            .changed();
-                        changed |= ui
-                            .selectable_value(
-                                &mut cfg.source,
-                                ReceiverSource::BluetoothExternal,
-                                "Bluetooth SPP Android (u-blox / Reach)",
                             )
                             .changed();
                         changed |= ui
@@ -300,14 +397,35 @@ pub fn render_gnss_panel(ui: &mut egui::Ui, app: &mut SdncFieldApp, tel: &GnssLi
                             .text("Hauteur canne (m)"),
                     )
                     .changed();
+                changed |= ui
+                    .add(
+                        egui::Slider::new(&mut cfg.antenna_arp_offset_m, 0.0..=0.35)
+                            .text("Offset ARP→APC (m)"),
+                    )
+                    .changed();
+                ui.label(
+                    RichText::new(format!(
+                        "Hauteur totale antenne : {:.3} m",
+                        cfg.total_antenna_height_m()
+                    ))
+                    .size(10.5)
+                    .color(Color32::GRAY),
+                );
 
                 if changed {
                     *app.gnss.config.lock().unwrap_or_else(|e| e.into_inner()) = cfg;
                 }
             });
 
-        // 5. Client NTRIP v1/v2 (Corrections RTCM3)
-        egui::CollapsingHeader::new("Client NTRIP (Corrections RTCM3 MSM7)")
+        // 5. Skyplot Polaire & Barres C/N0 (SNR)
+        egui::CollapsingHeader::new("🛰 Skyplot Constellation & SNR")
+            .default_open(false)
+            .show(ui, |ui| {
+                render_skyplot(ui, tel);
+            });
+
+        // 6. Client NTRIP v1/v2 (Corrections RTCM3 MSM4/MSM7)
+        egui::CollapsingHeader::new("🌐 Client NTRIP (RTCM 3.3 MSM4/MSM7)")
             .default_open(false)
             .show(ui, |ui| {
                 let mut cfg = app
@@ -319,7 +437,7 @@ pub fn render_gnss_panel(ui: &mut egui::Ui, app: &mut SdncFieldApp, tel: &GnssLi
                 let mut changed = false;
 
                 changed |= ui
-                    .checkbox(&mut cfg.ntrip.enabled, "Activer NTRIP")
+                    .checkbox(&mut cfg.ntrip.enabled, "Activer NTRIP (Centipède / Orphéon / Teria)")
                     .changed();
                 ui.horizontal(|ui| {
                     ui.label("Caster:");
@@ -354,15 +472,18 @@ pub fn render_gnss_panel(ui: &mut egui::Ui, app: &mut SdncFieldApp, tel: &GnssLi
                 }
             });
 
-        // 6. Workflow PPK (Enregistrement RINEX 3.04 + Post-traitement Forward/Backward)
-        egui::CollapsingHeader::new("Mode PPK — Enregistrement & Post-Traitement")
+        // 7. Post-Traitement PPK complet (RINEX 3.04 L1/L2 & fichiers bruts .UBX directs)
+        egui::CollapsingHeader::new("🧮 Post-Traitement PPK (RINEX 3 & .UBX L1/L2)")
             .default_open(true)
             .show(ui, |ui| {
                 ui.horizontal(|ui| {
                     let rec = tel.ppk_recording;
                     if !rec {
                         if ui
-                            .button(RichText::new("⏺ Enregistrer RINEX (.obs)").color(Color32::from_rgb(255, 110, 110)))
+                            .button(
+                                RichText::new("⏺ Enregistrer RINEX L1/L2 (.obs)")
+                                    .color(Color32::from_rgb(255, 110, 110)),
+                            )
                             .clicked()
                         {
                             app.gnss.set_ppk_recording(true);
@@ -370,37 +491,80 @@ pub fn render_gnss_panel(ui: &mut egui::Ui, app: &mut SdncFieldApp, tel: &GnssLi
                     } else if ui.button("⏹ Stopper RINEX").clicked() {
                         app.gnss.set_ppk_recording(false);
                     }
-                    ui.label(format!("{} époques", tel.ppk_epochs_logged));
+                    ui.label(format!("{} ép.", tel.ppk_epochs_logged));
                 });
 
                 ui.separator();
-                ui.label(RichText::new("Fichiers RINEX 3 pour calcul PPK :").strong());
-                ui.horizontal(|ui| {
-                    ui.label("Rover .obs:");
-                    ui.text_edit_singleline(&mut app.ppk_rover_path);
-                });
-                ui.horizontal(|ui| {
-                    ui.label("Base .obs:");
-                    ui.text_edit_singleline(&mut app.ppk_base_path);
-                });
-                ui.horizontal(|ui| {
-                    ui.label("Nav .nav:");
-                    ui.text_edit_singleline(&mut app.ppk_nav_path);
-                });
-                ui.checkbox(
-                    &mut app.ppk_combined,
-                    "Lissage Combined (Forward + Backward)",
+                ui.label(
+                    RichText::new("Entrées PPK (RINEX 3 .obs/.rnx ou binaire u-blox .ubx) :")
+                        .strong()
+                        .size(11.0),
                 );
 
                 ui.horizontal(|ui| {
+                    ui.label("Rover:");
+                    ui.text_edit_singleline(&mut app.ppk_rover_path);
+                    #[cfg(not(target_os = "android"))]
+                    if ui.small_button("📂").on_hover_text("Choisir .obs/.rnx/.ubx Rover").clicked() {
+                        if let Some(p) = rfd::FileDialog::new()
+                            .add_filter("RINEX / UBX", &["obs", "rnx", "ubx", "24o", "25o", "26o"])
+                            .pick_file()
+                        {
+                            app.ppk_rover_path = p.to_string_lossy().to_string();
+                        }
+                    }
+                });
+
+                ui.horizontal(|ui| {
+                    ui.label("Base :");
+                    ui.text_edit_singleline(&mut app.ppk_base_path);
+                    #[cfg(not(target_os = "android"))]
+                    if ui.small_button("📂").on_hover_text("Choisir .obs/.rnx/.ubx Base RGP").clicked() {
+                        if let Some(p) = rfd::FileDialog::new()
+                            .add_filter("RINEX / UBX", &["obs", "rnx", "ubx", "24o", "25o", "26o"])
+                            .pick_file()
+                        {
+                            app.ppk_base_path = p.to_string_lossy().to_string();
+                        }
+                    }
+                });
+
+                ui.horizontal(|ui| {
+                    ui.label("Nav  :");
+                    ui.text_edit_singleline(&mut app.ppk_nav_path);
+                    #[cfg(not(target_os = "android"))]
+                    if ui.small_button("📂").on_hover_text("Choisir .nav/.rnx Éphémérides").clicked() {
+                        if let Some(p) = rfd::FileDialog::new()
+                            .add_filter("RINEX NAV", &["nav", "rnx", "24n", "25n", "26n", "26p"])
+                            .pick_file()
+                        {
+                            app.ppk_nav_path = p.to_string_lossy().to_string();
+                        }
+                    }
+                });
+
+                ui.horizontal(|ui| {
+                    ui.checkbox(&mut app.ppk_combined, "Combined (Fwd+Bwd)");
+                    ui.checkbox(&mut app.ppk_static_mode, "Statique (Pivot)");
+                });
+                ui.horizontal(|ui| {
+                    ui.label("H. antenne base (m) :");
+                    ui.add(
+                        egui::DragValue::new(&mut app.ppk_base_antenna_h_m)
+                            .speed(0.01)
+                            .range(0.0..=10.0),
+                    );
+                });
+
+                ui.horizontal(|ui| {
                     if ui
-                        .add_enabled(!tel.ppk_running, egui::Button::new("⚙ Calculer PPK"))
+                        .add_enabled(!tel.ppk_running, egui::Button::new("⚙ Lancer Calcul PPK"))
                         .clicked()
                     {
                         app.launch_ppk_from_files();
                     }
                     if ui
-                        .add_enabled(!tel.ppk_running, egui::Button::new("🧪 Démo PPK (40 ép.)"))
+                        .add_enabled(!tel.ppk_running, egui::Button::new("🧪 Démo PPK L1+L2"))
                         .clicked()
                     {
                         app.gnss.run_ppk_demo_async();
@@ -409,18 +573,43 @@ pub fn render_gnss_panel(ui: &mut egui::Ui, app: &mut SdncFieldApp, tel: &GnssLi
 
                 if let Some(rep) = &tel.last_ppk_report {
                     ui.separator();
+                    let band_str = if rep.used_dual_freq_l1_l2 { "L1+L2" } else { "L1" };
                     ui.label(
                         RichText::new(format!(
-                            "Rapport PPK : {}/{} FIX ({:.1}%)",
-                            rep.fix_epochs, rep.total_epochs, rep.fix_rate_pct
+                            "Rapport PPK ({}) : {}/{} FIX ({:.1}%)",
+                            band_str, rep.fix_epochs, rep.total_epochs, rep.fix_rate_pct
                         ))
                         .strong()
                         .color(Color32::LIGHT_GREEN),
                     );
                     ui.label(format!(
-                        "Float: {} | Single: {} | σH: {:.2} cm | σV: {:.2} cm",
-                        rep.float_epochs, rep.single_epochs, rep.mean_std_h_cm, rep.mean_std_v_cm
+                        "Float: {} | Single: {} | σH: {:.2} cm | σV: {:.2} cm | Base: {:.0} m",
+                        rep.float_epochs,
+                        rep.single_epochs,
+                        rep.mean_std_h_cm,
+                        rep.mean_std_v_cm,
+                        rep.baseline_mean_m
                     ));
+                    if let Some(ref st) = rep.static_solution {
+                        ui.label(
+                            RichText::new(format!(
+                                "Pivot Statique : {:.7}°, {:.7}°, Z={:.3} m",
+                                st.lat_deg, st.lon_deg, st.alt_orthometric_m
+                            ))
+                            .size(10.5)
+                            .color(Color32::from_rgb(130, 235, 255)),
+                        );
+                    }
+                    if !rep.event_solutions.is_empty() {
+                        ui.label(
+                            RichText::new(format!(
+                                "Événements recalés PPK : {}",
+                                rep.event_solutions.len()
+                            ))
+                            .size(10.5)
+                            .color(Color32::GOLD),
+                        );
+                    }
                     ui.horizontal(|ui| {
                         if ui.button("💾 Carte (.gpkg)").clicked() {
                             app.import_ppk_report_as_layer(tel);
@@ -463,21 +652,22 @@ fn render_skyplot(ui: &mut egui::Ui, tel: &GnssLiveTelemetry) {
     );
 
     for sat in &tel.solution.satellites {
-        let r = radius * ((90.0 - sat.elevation_deg.clamp(0.0, 90.0)) / 90.0);
-        let az = sat.azimuth_deg.to_radians();
-        let pos = Pos2::new(center.x + r * az.sin(), center.y - r * az.cos());
+        let el_clamped = sat.elevation_deg.clamp(0.0, 90.0);
+        let r = radius * (1.0 - el_clamped / 90.0);
+        let az_rad = sat.azimuth_deg.to_radians();
+        let pos = Pos2::new(center.x + r * az_rad.sin(), center.y - r * az_rad.cos());
         let col = if sat.used_in_fix {
             Color32::from_rgb(50, 235, 120)
         } else {
-            Color32::from_rgb(180, 140, 70)
+            Color32::from_rgb(235, 160, 50)
         };
-        painter.circle_filled(pos, 7.5, col);
+        painter.circle_filled(pos, 5.5, col);
         painter.text(
-            pos,
-            egui::Align2::CENTER_CENTER,
+            pos + Vec2::new(7.0, 0.0),
+            egui::Align2::LEFT_CENTER,
             sat.sat.code(),
-            egui::FontId::proportional(8.0),
-            Color32::BLACK,
+            egui::FontId::proportional(9.0),
+            Color32::WHITE,
         );
     }
 }
